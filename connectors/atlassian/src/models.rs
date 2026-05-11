@@ -1,89 +1,10 @@
 use chrono::DateTime;
+use omni_connector_sdk::{ConnectorEvent, DocumentMetadata, DocumentPermissions};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
-pub use shared::models::{ActionDefinition, ConnectorManifest};
-use shared::models::{ConnectorEvent, DocumentAttributes, DocumentMetadata, DocumentPermissions};
+use serde_json::json;
+use shared::models::DocumentAttributes;
 use std::collections::HashMap;
 use time::OffsetDateTime;
-
-// ============================================================================
-// Connector Protocol Models
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncResponse {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-impl SyncResponse {
-    pub fn started() -> Self {
-        Self {
-            status: "started".to_string(),
-            message: None,
-        }
-    }
-
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            status: "error".to_string(),
-            message: Some(msg.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelRequest {
-    pub sync_run_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelResponse {
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionRequest {
-    pub action: String,
-    pub params: JsonValue,
-    pub credentials: JsonValue,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionResponse {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<JsonValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl ActionResponse {
-    pub fn success(result: JsonValue) -> Self {
-        Self {
-            status: "success".to_string(),
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    pub fn not_supported(action: &str) -> Self {
-        Self {
-            status: "error".to_string(),
-            result: None,
-            error: Some(format!("Action not supported: {}", action)),
-        }
-    }
-
-    pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            status: "error".to_string(),
-            result: None,
-            error: Some(msg.into()),
-        }
-    }
-}
 
 // ============================================================================
 // Atlassian Models
@@ -247,9 +168,21 @@ pub struct JiraFields {
     pub labels: Option<Vec<String>>,
     pub comment: Option<JiraComments>,
     pub components: Option<Vec<JiraComponent>>,
+    /// Issue-level security: when set, restricts the issue's read access to
+    /// the holders of the named security level, narrowing the project's
+    /// permission scheme grants.
+    #[serde(default)]
+    pub security: Option<JiraSecurityLevel>,
     /// Captures custom fields (customfield_XXXXX) and any other unknown fields
     #[serde(flatten)]
     pub extra_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraSecurityLevel {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +359,328 @@ pub struct JiraField {
 }
 
 // ============================================================================
+// Permission Models
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluenceSpacePermission {
+    pub id: String,
+    pub principal: ConfluencePermissionPrincipal,
+    pub operation: ConfluencePermissionOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluencePermissionPrincipal {
+    #[serde(rename = "type")]
+    pub principal_type: String, // "user" or "group"
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluencePermissionOperation {
+    pub key: String, // "read", "write", "administer", etc.
+    #[serde(rename = "targetType")]
+    pub target_type: String, // "space", "page", etc.
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceSpacePermissionsResponse {
+    pub results: Vec<ConfluenceSpacePermission>,
+    #[serde(rename = "_links")]
+    pub links: Option<ConfluenceResponseLinks>,
+}
+
+// ============================================================================
+// Jira Issue Security Schemes
+// /rest/api/3/project/{key}/issuesecuritylevelscheme returns the scheme
+// /rest/api/3/issuesecurityschemes/{schemeId} returns its full level list.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraProjectIssueSecuritySchemeResponse {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraIssueSecuritySchemeResponse {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub levels: Vec<JiraSecurityLevelDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraSecurityLevelDetail {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraSecurityLevelMembersResponse {
+    pub values: Vec<JiraSecurityLevelMember>,
+    #[serde(rename = "isLast", default)]
+    pub is_last: bool,
+}
+
+/// One holder entry on an issue security level. `holder.type` is one of
+/// `user`, `group`, `projectRole`, plus rarer types like `userCustomField`,
+/// `groupCustomField`, `reporter`, `assignee`, `projectLead`, `applicationRole`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraSecurityLevelMember {
+    pub id: i64,
+    pub holder: JiraSecurityHolder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraSecurityHolder {
+    #[serde(rename = "type")]
+    pub holder_type: String,
+    /// For user/group/applicationRole/projectRole this is the holder's identifier
+    /// (accountId / groupId / role-id / role-key as a string).
+    #[serde(default)]
+    pub parameter: Option<String>,
+}
+
+// ============================================================================
+// Jira Permission Scheme (project-level)
+// /rest/api/3/project/{key}/permissionscheme?expand=permissions
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraPermissionSchemeResponse {
+    pub id: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub permissions: Vec<JiraPermissionGrant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraPermissionGrant {
+    pub id: i64,
+    /// Permission key, e.g. `BROWSE_PROJECTS`, `EDIT_ISSUES`.
+    pub permission: String,
+    pub holder: JiraPermissionHolder,
+}
+
+/// Holder of a permission grant. `holder_type` is one of `user`, `group`,
+/// `projectRole`, `anyone`, `applicationRole`, `assignee`, `reporter`,
+/// `projectLead`, `userCustomField`, `groupCustomField`. We handle the static
+/// types; dynamic types (assignee/reporter/etc.) get a one-line warn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraPermissionHolder {
+    #[serde(rename = "type")]
+    pub holder_type: String,
+    /// Older shape: human-readable id (group name / accountId).
+    #[serde(default)]
+    pub parameter: Option<String>,
+    /// Newer shape: the canonical id (groupId for groups, accountId for users,
+    /// role-id for projectRole, role-key for applicationRole).
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+impl JiraPermissionHolder {
+    /// Best-effort canonical identifier — prefer `value` (groupId / accountId
+    /// / role-key) over `parameter` (legacy human-readable).
+    pub fn identifier(&self) -> Option<&str> {
+        self.value.as_deref().or(self.parameter.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraProjectRolesResponse {
+    #[serde(flatten)]
+    pub roles: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraRoleActorsResponse {
+    pub name: String,
+    pub actors: Vec<JiraRoleActor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraRoleActor {
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub actor_type: String, // "atlassian-user-role-actor" or "atlassian-group-role-actor"
+    pub name: Option<String>,
+    #[serde(rename = "actorUser")]
+    pub actor_user: Option<JiraActorUser>,
+    #[serde(rename = "actorGroup")]
+    pub actor_group: Option<JiraActorGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraActorUser {
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraActorGroup {
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlassianUserBulkResponse {
+    pub values: Vec<AtlassianUserBulkItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlassianUserBulkItem {
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+    #[serde(rename = "emailAddress")]
+    pub email_address: Option<String>,
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceGroupMembersResponse {
+    pub results: Vec<ConfluenceGroupMember>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluenceGroupMember {
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JiraGroupMembersResponse {
+    pub values: Vec<JiraGroupMember>,
+    #[serde(rename = "isLast", default)]
+    pub is_last: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JiraGroupMember {
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+}
+
+// ============================================================================
+// Confluence Content Restrictions (read operation)
+// /wiki/rest/api/content/{id}/restriction/byOperation/read
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceContentRestriction {
+    pub operation: String,
+    pub restrictions: ConfluenceRestrictionPrincipals,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceRestrictionPrincipals {
+    #[serde(default)]
+    pub user: ConfluenceRestrictionUserList,
+    #[serde(default)]
+    pub group: ConfluenceRestrictionGroupList,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ConfluenceRestrictionUserList {
+    #[serde(default)]
+    pub results: Vec<ConfluenceRestrictionUser>,
+    #[serde(default)]
+    pub size: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceRestrictionUser {
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ConfluenceRestrictionGroupList {
+    #[serde(default)]
+    pub results: Vec<ConfluenceRestrictionGroup>,
+    #[serde(default)]
+    pub size: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConfluenceRestrictionGroup {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+// ============================================================================
+// Atlassian Organization Admin API
+// api.atlassian.com/admin/v1/orgs/{orgId}/users   (cursor-paginated)
+// api.atlassian.com/admin/v1/orgs/{orgId}/groups  (cursor-paginated)
+// api.atlassian.com/admin/v1/orgs/{orgId}/groups/{groupId}/members
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminPageLinks {
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminUsersResponse {
+    pub data: Vec<OrgAdminUser>,
+    #[serde(default)]
+    pub links: Option<OrgAdminPageLinks>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminUser {
+    pub account_id: String,
+    /// Atlassian's privacy mode does NOT hide this field for org-admin
+    /// callers; this is the load-bearing value of the org-admin path.
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// "active", "inactive", or "closed". We filter to active for the
+    /// resolution map so deactivated users don't gain access.
+    #[serde(default)]
+    pub account_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminGroupsResponse {
+    pub data: Vec<OrgAdminGroup>,
+    #[serde(default)]
+    pub links: Option<OrgAdminPageLinks>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminGroup {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminGroupMembersResponse {
+    pub data: Vec<OrgAdminGroupMember>,
+    #[serde(default)]
+    pub links: Option<OrgAdminPageLinks>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgAdminGroupMember {
+    pub account_id: String,
+}
+
+// ============================================================================
 // CQL Search Response Types (Confluence v1 REST API)
 // ============================================================================
 
@@ -552,6 +807,14 @@ impl ConfluenceCqlPage {
 pub struct AtlassianConnectorState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_sync_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Confluence page version by "{space_id}:{page_id}". Used by full-sync
+    /// dedup to skip pages whose content hasn't changed. Jira has no
+    /// equivalent — its incremental sync relies on `last_successful_sync_at`
+    /// and the indexer's idempotent upsert by document_id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub confluence_page_versions: HashMap<String, i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +916,7 @@ impl ConfluencePage {
         source_id: String,
         base_url: &str,
         content_id: String,
+        permissions: DocumentPermissions,
     ) -> ConnectorEvent {
         let document_id = format!("confluence_page_{}_{}", self.space_id, self.id);
         let url = format!("{}/wiki{}", base_url, self.links.webui.clone());
@@ -675,12 +939,6 @@ impl ConfluencePage {
             url: Some(url),
             path: Some(path),
             extra: Some(extra),
-        };
-
-        let permissions = DocumentPermissions {
-            public: true,
-            users: vec![],
-            groups: vec![],
         };
 
         let attributes = self.to_attributes().into_attributes();
@@ -821,6 +1079,7 @@ impl JiraIssue {
         source_id: String,
         base_url: &str,
         content_id: String,
+        permissions: DocumentPermissions,
     ) -> ConnectorEvent {
         let document_id = format!("jira_issue_{}_{}", self.fields.project.key, self.key);
 
@@ -856,12 +1115,6 @@ impl JiraIssue {
             url,
             path: Some(format!("{}/{}", self.fields.project.name, self.key)),
             extra: Some(extra),
-        };
-
-        let permissions = DocumentPermissions {
-            users: vec![],
-            groups: vec![],
-            public: true,
         };
 
         let attributes = self.to_attributes().into_attributes();

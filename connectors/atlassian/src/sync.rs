@@ -1,292 +1,93 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use redis::{AsyncCommands, Client as RedisClient};
-use shared::models::{
-    ConfluenceSourceConfig, JiraSourceConfig, ServiceCredential, ServiceProvider, SourceType,
-    SyncRequest, SyncType,
+use chrono::Utc;
+use omni_connector_sdk::{
+    ConnectorEvent, SdkClient, ServiceCredential, Source, SourceType, SyncContext, SyncType,
 };
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use shared::models::{ConfluenceSourceConfig, JiraSourceConfig, ServiceProvider};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{AtlassianCredentials, AuthManager};
-use crate::client::AtlassianApi;
+use crate::client::{AtlassianApi, OrgGroupInfo};
 use crate::confluence::ConfluenceProcessor;
 use crate::jira::JiraProcessor;
 use crate::models::{AtlassianConnectorState, AtlassianWebhookEvent};
-use shared::SdkClient;
+use crate::user_resolver::UserResolver;
 
 pub struct SyncManager {
-    sdk_client: SdkClient,
+    pub sdk_client: SdkClient,
     auth_manager: AuthManager,
     client: Arc<dyn AtlassianApi>,
-    confluence_processor: ConfluenceProcessor,
-    jira_processor: JiraProcessor,
-    active_syncs: DashMap<String, Arc<AtomicBool>>,
     webhook_url: Option<String>,
 }
 
-pub struct SyncState {
-    redis_client: RedisClient,
-}
-
-impl SyncState {
-    pub fn new(redis_client: RedisClient) -> Self {
-        Self { redis_client }
-    }
-
-    pub fn get_confluence_sync_key(&self, source_id: &str, space_key: &str) -> String {
-        format!("atlassian:confluence:sync:{}:{}", source_id, space_key)
-    }
-
-    pub fn get_jira_sync_key(&self, source_id: &str, project_key: &str) -> String {
-        format!("atlassian:jira:sync:{}:{}", source_id, project_key)
-    }
-
-    pub fn get_test_confluence_sync_key(&self, source_id: &str, space_key: &str) -> String {
-        format!("atlassian:confluence:sync:test:{}:{}", source_id, space_key)
-    }
-
-    pub fn get_test_jira_sync_key(&self, source_id: &str, project_key: &str) -> String {
-        format!("atlassian:jira:sync:test:{}:{}", source_id, project_key)
-    }
-
-    pub async fn get_confluence_last_sync(
-        &self,
-        source_id: &str,
-        space_key: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = if cfg!(test) {
-            self.get_test_confluence_sync_key(source_id, space_key)
-        } else {
-            self.get_confluence_sync_key(source_id, space_key)
-        };
-
-        let result: Option<String> = conn.get(&key).await?;
-        if let Some(timestamp_str) = result {
-            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
-                if let Some(dt) = DateTime::from_timestamp(timestamp, 0) {
-                    return Ok(Some(dt));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn set_confluence_last_sync(
-        &self,
-        source_id: &str,
-        space_key: &str,
-        sync_time: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = if cfg!(test) {
-            self.get_test_confluence_sync_key(source_id, space_key)
-        } else {
-            self.get_confluence_sync_key(source_id, space_key)
-        };
-
-        let timestamp = sync_time.timestamp();
-        let _: () = conn.set_ex(&key, timestamp, 30 * 24 * 60 * 60).await?; // 30 days expiry
-        Ok(())
-    }
-
-    pub async fn get_jira_last_sync(
-        &self,
-        source_id: &str,
-        project_key: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = if cfg!(test) {
-            self.get_test_jira_sync_key(source_id, project_key)
-        } else {
-            self.get_jira_sync_key(source_id, project_key)
-        };
-
-        let result: Option<String> = conn.get(&key).await?;
-        if let Some(timestamp_str) = result {
-            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
-                if let Some(dt) = DateTime::from_timestamp(timestamp, 0) {
-                    return Ok(Some(dt));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn set_jira_last_sync(
-        &self,
-        source_id: &str,
-        project_key: &str,
-        sync_time: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = if cfg!(test) {
-            self.get_test_jira_sync_key(source_id, project_key)
-        } else {
-            self.get_jira_sync_key(source_id, project_key)
-        };
-
-        let timestamp = sync_time.timestamp();
-        let _: () = conn.set_ex(&key, timestamp, 30 * 24 * 60 * 60).await?; // 30 days expiry
-        Ok(())
-    }
-
-    pub async fn get_all_synced_confluence_spaces(
-        &self,
-        source_id: &str,
-    ) -> Result<HashSet<String>> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let pattern = if cfg!(test) {
-            format!("atlassian:confluence:sync:test:{}:*", source_id)
-        } else {
-            format!("atlassian:confluence:sync:{}:*", source_id)
-        };
-
-        let keys: Vec<String> = conn.keys(&pattern).await?;
-        let prefix = if cfg!(test) {
-            format!("atlassian:confluence:sync:test:{}:", source_id)
-        } else {
-            format!("atlassian:confluence:sync:{}:", source_id)
-        };
-
-        let space_keys: HashSet<String> = keys
-            .into_iter()
-            .filter_map(|key| key.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect();
-
-        Ok(space_keys)
-    }
-
-    pub async fn get_all_synced_jira_projects(&self, source_id: &str) -> Result<HashSet<String>> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let pattern = if cfg!(test) {
-            format!("atlassian:jira:sync:test:{}:*", source_id)
-        } else {
-            format!("atlassian:jira:sync:{}:*", source_id)
-        };
-
-        let keys: Vec<String> = conn.keys(&pattern).await?;
-        let prefix = if cfg!(test) {
-            format!("atlassian:jira:sync:test:{}:", source_id)
-        } else {
-            format!("atlassian:jira:sync:{}:", source_id)
-        };
-
-        let project_keys: HashSet<String> = keys
-            .into_iter()
-            .filter_map(|key| key.strip_prefix(&prefix).map(|s| s.to_string()))
-            .collect();
-
-        Ok(project_keys)
-    }
-
-    pub fn get_confluence_page_sync_key(
-        &self,
-        source_id: &str,
-        space_id: &str,
-        page_id: &str,
-    ) -> String {
-        if cfg!(test) {
-            format!(
-                "atlassian:confluence:page:test:{}:{}:{}",
-                source_id, space_id, page_id
-            )
-        } else {
-            format!(
-                "atlassian:confluence:page:{}:{}:{}",
-                source_id, space_id, page_id
-            )
-        }
-    }
-
-    pub async fn get_confluence_page_version(
-        &self,
-        source_id: &str,
-        space_id: &str,
-        page_id: &str,
-    ) -> Result<Option<i32>> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = self.get_confluence_page_sync_key(source_id, space_id, page_id);
-
-        let result: Option<String> = conn.get(&key).await?;
-        if let Some(version_str) = result {
-            if let Ok(version) = version_str.parse::<i32>() {
-                return Ok(Some(version));
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn set_confluence_page_version(
-        &self,
-        source_id: &str,
-        space_id: &str,
-        page_id: &str,
-        version: i32,
-    ) -> Result<()> {
-        let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let key = self.get_confluence_page_sync_key(source_id, space_id, page_id);
-
-        let _: () = conn.set_ex(&key, version, 30 * 24 * 60 * 60).await?; // 30 days expiry
-        Ok(())
-    }
-}
-
 impl SyncManager {
-    pub fn new(
-        redis_client: RedisClient,
-        sdk_client: SdkClient,
-        webhook_url: Option<String>,
-    ) -> Self {
+    pub fn new(sdk_client: SdkClient, webhook_url: Option<String>) -> Self {
         let client: Arc<dyn AtlassianApi> = Arc::new(crate::client::AtlassianClient::new());
-        Self::with_client(client, redis_client, sdk_client, webhook_url)
+        Self::with_client(client, sdk_client, webhook_url)
     }
 
     pub fn with_client(
         client: Arc<dyn AtlassianApi>,
-        redis_client: RedisClient,
         sdk_client: SdkClient,
         webhook_url: Option<String>,
     ) -> Self {
         Self {
-            sdk_client: sdk_client.clone(),
+            sdk_client,
             auth_manager: AuthManager::new(),
-            confluence_processor: ConfluenceProcessor::new(
-                client.clone(),
-                sdk_client.clone(),
-                redis_client.clone(),
-            ),
-            jira_processor: JiraProcessor::new(client.clone(), sdk_client),
             client,
-            active_syncs: DashMap::new(),
             webhook_url,
         }
     }
 
-    pub fn cancel_sync(&self, sync_run_id: &str) -> bool {
-        if let Some(cancelled) = self.active_syncs.get(sync_run_id) {
-            cancelled.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Execute a sync based on the request from connector-manager
-    pub async fn sync_source(&mut self, request: SyncRequest) -> Result<()> {
-        let sync_run_id = &request.sync_run_id;
-        let source_id = &request.source_id;
+    /// Execute a sync driven by the SDK. Delegates lifecycle (complete / fail
+    /// / cancel) to the SDK's `SyncContext`: return `Ok(())` for success and
+    /// `Err` for failure — the SDK auto-fails on `Err` and the cancel path
+    /// below reports `cancelled` explicitly.
+    pub async fn run_sync(
+        &self,
+        _source: Source,
+        _credentials: Option<ServiceCredential>,
+        state: Option<AtlassianConnectorState>,
+        ctx: SyncContext,
+    ) -> Result<()> {
+        let sync_run_id = ctx.sync_run_id().to_string();
+        let source_id = ctx.source_id().to_string();
 
         info!(
             "Starting sync for source: {} (sync_run_id: {})",
             source_id, sync_run_id
         );
 
-        // Fetch source via SDK
+        let outcome = self
+            .run_sync_inner(&source_id, &sync_run_id, &ctx, state)
+            .await;
+
+        match outcome {
+            Ok(Some(_total_processed)) => {
+                ctx.complete().await?;
+                Ok(())
+            }
+            // Cancelled mid-flight: report `cancelled` rather than `failed`.
+            Ok(None) => {
+                info!("Sync {} was cancelled", sync_run_id);
+                ctx.cancel().await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inner sync body. Returns `Ok(None)` if the sync was cancelled
+    /// mid-flight, distinct from a successful completion or a hard failure.
+    async fn run_sync_inner(
+        &self,
+        source_id: &str,
+        sync_run_id: &str,
+        ctx: &SyncContext,
+        state: Option<AtlassianConnectorState>,
+    ) -> Result<Option<u32>> {
         let source = self
             .sdk_client
             .get_source(source_id)
@@ -294,12 +95,17 @@ impl SyncManager {
             .context("Failed to fetch source via SDK")?;
 
         if !source.is_active {
-            let err_msg = format!("Source is not active: {}", source_id);
-            self.sdk_client.fail(sync_run_id, &err_msg).await?;
-            return Err(anyhow::anyhow!(err_msg));
+            return Err(anyhow!("Source is not active: {}", source_id));
         }
 
-        let source_type = source.source_type.clone();
+        let source_type = source.source_type;
+        if source_type != SourceType::Confluence && source_type != SourceType::Jira {
+            return Err(anyhow!(
+                "Invalid source type for Atlassian connector: {:?}",
+                source_type
+            ));
+        }
+
         let project_filters: Option<Vec<String>> = if source_type == SourceType::Jira {
             serde_json::from_value::<JiraSourceConfig>(source.config.clone())
                 .ok()
@@ -318,192 +124,302 @@ impl SyncManager {
             None
         };
 
-        if source_type != SourceType::Confluence && source_type != SourceType::Jira {
-            let err_msg = format!(
-                "Invalid source type for Atlassian connector: {:?}",
-                source_type
-            );
-            self.sdk_client.fail(sync_run_id, &err_msg).await?;
-            return Err(anyhow::anyhow!(err_msg));
-        }
-
-        // Fetch and validate credentials
         let service_creds = self.get_service_credentials(source_id).await?;
-        let (base_url, user_email, api_token) =
+        let (domain, sa_token, org_id, org_admin_api_key) =
             self.extract_atlassian_credentials(&service_creds)?;
 
         debug!("Validating Atlassian credentials...");
-        let mut credentials = match self
-            .get_or_validate_credentials(&base_url, &user_email, &api_token, Some(&source_type))
-            .await
-        {
-            Ok(creds) => creds,
-            Err(e) => {
-                self.sdk_client.fail(sync_run_id, &e.to_string()).await?;
-                return Err(e);
-            }
-        };
-        debug!("Successfully validated Atlassian credentials.");
-
-        if let Err(e) = self
-            .auth_manager
+        let mut credentials = self
+            .get_or_validate_credentials(&domain, &sa_token, Some(&source_type))
+            .await?;
+        if let (Some(org), Some(key)) = (org_id, org_admin_api_key) {
+            credentials = credentials.with_org_admin(org, key);
+        }
+        self.auth_manager
             .ensure_valid_credentials(&mut credentials, Some(&source_type))
+            .await?;
+        debug!(
+            "Successfully validated Atlassian credentials (org_admin configured: {}).",
+            credentials.has_org_admin()
+        );
+
+        // Pre-fetch the org-admin user + group directories once per sync. Both
+        // are empty when org-admin creds are not configured (resolver falls
+        // back to per-site bulk-user API).
+        let user_directory: Arc<HashMap<String, String>> = Arc::new(
+            self.client
+                .get_org_user_directory(&credentials)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Failed to fetch org user directory: {}", e);
+                    HashMap::new()
+                }),
+        );
+        let group_directory: HashMap<String, OrgGroupInfo> = self
+            .client
+            .get_org_group_directory(&credentials)
             .await
-        {
-            self.sdk_client.fail(sync_run_id, &e.to_string()).await?;
-            return Err(e);
+            .unwrap_or_else(|e| {
+                warn!("Failed to fetch org group directory: {}", e);
+                HashMap::new()
+            });
+        if credentials.has_org_admin() {
+            info!(
+                "Loaded org directory: {} users, {} groups",
+                user_directory.len(),
+                group_directory.len()
+            );
         }
+        let user_resolver = Arc::new(UserResolver::new(self.client.clone(), user_directory));
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.active_syncs
-            .insert(sync_run_id.to_string(), cancelled.clone());
-
+        let existing_state = state.unwrap_or_default();
+        let sync_mode = ctx.sync_mode();
         let sync_start = Utc::now();
-        let is_full_sync = request.sync_mode == SyncType::Full;
-        let last_sync_time = request
-            .last_sync_at
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        let last_sync = existing_state
+            .last_successful_sync_at
+            .unwrap_or_else(|| sync_start - chrono::Duration::hours(24));
 
-        let result = if is_full_sync {
-            info!("Performing full sync for source: {}", source.name);
-            self.execute_full_sync(
-                &credentials,
-                source_id,
-                sync_run_id,
-                &source.source_type,
-                &cancelled,
-                &project_filters,
-                &space_filters,
-            )
-            .await
-        } else {
-            info!("Performing incremental sync for source: {}", source.name);
-            let last_sync =
-                last_sync_time.unwrap_or_else(|| sync_start - chrono::Duration::hours(24));
+        // The SDK server constructs its own SdkClient for the SyncContext, so
+        // emit/flush must go through `ctx.sdk_client()` — using a different
+        // SdkClient instance would buffer events on a client whose buffer
+        // ctx.complete()/ctx.save_connector_state() never flush, stranding
+        // events at end-of-sync.
+        let sync_sdk_client = ctx.sdk_client().clone();
 
-            self.execute_incremental_sync(
-                &credentials,
-                source_id,
-                sync_run_id,
-                &source.source_type,
-                last_sync,
-                &cancelled,
-                &project_filters,
-                &space_filters,
-            )
-            .await
+        let (total_processed, new_page_versions, encountered_groups) = match source_type {
+            SourceType::Confluence => {
+                let processor = ConfluenceProcessor::with_page_versions_and_resolver(
+                    self.client.clone(),
+                    sync_sdk_client.clone(),
+                    existing_state.confluence_page_versions.clone(),
+                    user_resolver.clone(),
+                );
+                let result = if sync_mode == SyncType::Full {
+                    info!(
+                        "Performing full Confluence sync for source: {}",
+                        source.name
+                    );
+                    processor
+                        .sync_all_spaces(&credentials, source_id, sync_run_id, ctx, &space_filters)
+                        .await
+                } else {
+                    info!(
+                        "Performing incremental Confluence sync for source: {}",
+                        source.name
+                    );
+                    processor
+                        .sync_all_spaces_incremental(
+                            &credentials,
+                            source_id,
+                            sync_run_id,
+                            last_sync,
+                            ctx,
+                            &space_filters,
+                        )
+                        .await
+                };
+                let count = result?;
+                let groups = processor.drain_encountered_groups();
+                (count, processor.drain_page_versions(), groups)
+            }
+            SourceType::Jira => {
+                let processor = JiraProcessor::with_resolver(
+                    self.client.clone(),
+                    sync_sdk_client.clone(),
+                    user_resolver.clone(),
+                );
+                let result = if sync_mode == SyncType::Full {
+                    info!("Performing full Jira sync for source: {}", source.name);
+                    processor
+                        .sync_all_projects(
+                            &credentials,
+                            source_id,
+                            sync_run_id,
+                            ctx,
+                            &project_filters,
+                        )
+                        .await
+                } else {
+                    info!(
+                        "Performing incremental Jira sync for source: {}",
+                        source.name
+                    );
+                    processor
+                        .sync_issues_updated_since(
+                            &credentials,
+                            source_id,
+                            last_sync,
+                            project_filters.as_ref(),
+                            sync_run_id,
+                            ctx,
+                        )
+                        .await
+                };
+                let count = result?;
+                let groups = processor.drain_encountered_groups();
+                (
+                    count,
+                    existing_state.confluence_page_versions.clone(),
+                    groups,
+                )
+            }
+            _ => unreachable!(),
         };
 
-        if cancelled.load(Ordering::SeqCst) {
-            info!("Sync {} was cancelled", sync_run_id);
-            let _ = self.sdk_client.cancel(sync_run_id).await;
-            self.active_syncs.remove(sync_run_id);
-            return Ok(());
+        if ctx.is_cancelled() {
+            return Ok(None);
         }
 
-        self.active_syncs.remove(sync_run_id);
+        self.sync_group_memberships(
+            &credentials,
+            source_id,
+            sync_run_id,
+            source_type,
+            encountered_groups,
+            &group_directory,
+            &user_resolver,
+            &sync_sdk_client,
+        )
+        .await;
 
-        match result {
-            Ok(total_processed) => {
-                info!(
-                    "Sync completed for source {}: {} documents processed",
-                    source.name, total_processed
-                );
-                self.sdk_client.complete(sync_run_id).await?;
+        info!(
+            "Sync completed for source {}: {} documents processed",
+            source.name, total_processed
+        );
 
-                if let Err(e) = self
-                    .ensure_webhook_registered(source_id, &credentials)
+        // ensure_webhook_registered may write webhook_id to connector state; we
+        // re-read state afterward so our checkpoint preserves any change.
+        if let Err(e) = self
+            .ensure_webhook_registered(source_id, &credentials)
+            .await
+        {
+            warn!("Failed to register webhook for source {}: {}", source_id, e);
+        }
+
+        let post_webhook_state: AtlassianConnectorState = self
+            .sdk_client
+            .get_connector_state(source_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+
+        let new_state = AtlassianConnectorState {
+            webhook_id: post_webhook_state.webhook_id.or(existing_state.webhook_id),
+            last_successful_sync_at: Some(sync_start),
+            confluence_page_versions: new_page_versions,
+        };
+        ctx.save_connector_state(serde_json::to_value(new_state)?)
+            .await?;
+
+        Ok(Some(total_processed))
+    }
+
+    /// For each groupId encountered during the sync, fetch its members,
+    /// resolve them to emails, and emit one GroupMembershipSync event. The
+    /// authz layer at query time joins these against doc permissions that
+    /// reference groupIds in `permissions->'groups'`.
+    ///
+    /// Per-group failures are warned and skipped so a single bad group can't
+    /// abort the membership sync. We do not fail the overall sync run on
+    /// errors here — documents have already been emitted.
+    pub async fn sync_group_memberships(
+        &self,
+        creds: &AtlassianCredentials,
+        source_id: &str,
+        sync_run_id: &str,
+        source_type: SourceType,
+        encountered_groups: HashMap<String, Option<String>>,
+        group_directory: &HashMap<String, OrgGroupInfo>,
+        user_resolver: &UserResolver,
+        sdk_client: &SdkClient,
+    ) {
+        if encountered_groups.is_empty() {
+            return;
+        }
+
+        info!(
+            "Emitting group membership events for {} groups (source: {})",
+            encountered_groups.len(),
+            source_id
+        );
+
+        for (group_id, encountered_name) in encountered_groups {
+            // Prefer the org-admin group directory when available — it
+            // exposes members for every directory user, including those
+            // with private email visibility. Falls back to the per-site
+            // group-member API when the org directory is empty (org-admin
+            // not configured) or the specific group isn't in it.
+            let (member_account_ids, group_name) = match group_directory.get(&group_id) {
+                Some(info) => (
+                    info.member_account_ids.clone(),
+                    info.name.clone().or(encountered_name),
+                ),
+                None => {
+                    let fetched = match source_type {
+                        SourceType::Confluence => {
+                            self.client
+                                .get_confluence_group_members(creds, &group_id)
+                                .await
+                        }
+                        SourceType::Jira => {
+                            self.client.get_jira_group_members(creds, &group_id).await
+                        }
+                        _ => unreachable!(),
+                    };
+                    match fetched {
+                        Ok(ids) => (ids, encountered_name),
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch members for group {} (source: {}): {}",
+                                group_id, source_id, e
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let mut member_emails = Vec::new();
+            if !member_account_ids.is_empty() {
+                match user_resolver
+                    .resolve_emails(creds, &member_account_ids)
                     .await
                 {
-                    warn!("Failed to register webhook for source {}: {}", source_id, e);
+                    Ok(id_email_pairs) => {
+                        member_emails.extend(id_email_pairs.into_iter().map(|(_, email)| email));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to resolve member emails for group {}: {}",
+                            group_id, e
+                        );
+                        continue;
+                    }
                 }
+            }
+            member_emails.sort();
+            member_emails.dedup();
 
-                Ok(())
-            }
-            Err(e) => {
-                error!("Sync failed for source {}: {}", source.name, e);
-                self.sdk_client.fail(sync_run_id, &e.to_string()).await?;
-                Err(e)
-            }
-        }
-    }
+            // FIXME(groups-key-rename): we're storing an Atlassian groupId in the
+            // `groups.email` column. Rename that column (and the GroupMembershipSync
+            // `group_email` field) to a generic identifier so non-email-keyed group
+            // systems are supported first-class.
+            let event = ConnectorEvent::GroupMembershipSync {
+                sync_run_id: sync_run_id.to_string(),
+                source_id: source_id.to_string(),
+                group_email: group_id.clone(),
+                group_name,
+                member_emails,
+            };
 
-    async fn execute_full_sync(
-        &mut self,
-        credentials: &AtlassianCredentials,
-        source_id: &str,
-        sync_run_id: &str,
-        source_type: &SourceType,
-        cancelled: &AtomicBool,
-        project_filters: &Option<Vec<String>>,
-        space_filters: &Option<Vec<String>>,
-    ) -> Result<u32> {
-        match source_type {
-            SourceType::Confluence => {
-                self.confluence_processor
-                    .sync_all_spaces(
-                        credentials,
-                        source_id,
-                        sync_run_id,
-                        cancelled,
-                        space_filters,
-                    )
-                    .await
+            if let Err(e) = sdk_client.emit_event(sync_run_id, source_id, event).await {
+                warn!(
+                    "Failed to emit GroupMembershipSync event for group {}: {}",
+                    group_id, e
+                );
             }
-            SourceType::Jira => {
-                self.jira_processor
-                    .sync_all_projects(
-                        credentials,
-                        source_id,
-                        sync_run_id,
-                        cancelled,
-                        project_filters,
-                    )
-                    .await
-            }
-            _ => Err(anyhow!("Unsupported source type: {:?}", source_type)),
-        }
-    }
-
-    async fn execute_incremental_sync(
-        &mut self,
-        credentials: &AtlassianCredentials,
-        source_id: &str,
-        sync_run_id: &str,
-        source_type: &SourceType,
-        last_sync: DateTime<Utc>,
-        cancelled: &AtomicBool,
-        project_filters: &Option<Vec<String>>,
-        space_filters: &Option<Vec<String>>,
-    ) -> Result<u32> {
-        match source_type {
-            SourceType::Confluence => {
-                self.confluence_processor
-                    .sync_all_spaces_incremental(
-                        credentials,
-                        source_id,
-                        sync_run_id,
-                        last_sync,
-                        cancelled,
-                        space_filters,
-                    )
-                    .await
-            }
-            SourceType::Jira => {
-                self.jira_processor
-                    .sync_issues_updated_since(
-                        credentials,
-                        source_id,
-                        last_sync,
-                        project_filters.as_ref(),
-                        sync_run_id,
-                        cancelled,
-                    )
-                    .await
-            }
-            _ => Err(anyhow!("Unsupported source type: {:?}", source_type)),
         }
     }
 
@@ -528,61 +444,47 @@ impl SyncManager {
     fn extract_atlassian_credentials(
         &self,
         creds: &ServiceCredential,
-    ) -> Result<(String, String, String)> {
-        let base_url = creds
+    ) -> Result<(String, String, Option<String>, Option<String>)> {
+        let domain = creds
             .config
-            .get("base_url")
+            .get("domain")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing base_url in service credentials config"))?
+            .ok_or_else(|| anyhow::anyhow!("Missing domain in service credentials config"))?
             .to_string();
 
-        let user_email = creds
-            .principal_email
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Missing principal_email in service credentials"))?
-            .to_string();
-
-        let api_token = creds
+        let sa_token = creds
             .credentials
-            .get("api_token")
+            .get("sa_token")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing api_token in service credentials"))?
+            .ok_or_else(|| anyhow::anyhow!("Missing sa_token in service credentials"))?
             .to_string();
 
-        Ok((base_url, user_email, api_token))
+        // Optional: organization-admin credentials enable the org-admin
+        // identity-resolution path. When absent the connector falls back to
+        // the per-site bulk-user API for accountId → email resolution.
+        let org_id = creds
+            .config
+            .get("org_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let org_admin_api_key = creds
+            .credentials
+            .get("org_admin_api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok((domain, sa_token, org_id, org_admin_api_key))
     }
 
     async fn get_or_validate_credentials(
         &self,
-        base_url: &str,
-        user_email: &str,
-        api_token: &str,
+        domain: &str,
+        sa_token: &str,
         source_type: Option<&SourceType>,
     ) -> Result<AtlassianCredentials> {
         self.auth_manager
-            .validate_credentials(base_url, user_email, api_token, source_type)
+            .validate_credentials(domain, sa_token, source_type)
             .await
-    }
-
-    pub async fn test_connection(
-        &self,
-        config: &(String, String, String),
-    ) -> Result<(Vec<String>, Vec<String>)> {
-        let (base_url, user_email, api_token) = config;
-        let credentials = self
-            .get_or_validate_credentials(base_url, user_email, api_token, None)
-            .await?;
-
-        let jira_projects = self
-            .auth_manager
-            .test_jira_permissions(&credentials)
-            .await?;
-        let confluence_spaces = self
-            .auth_manager
-            .test_confluence_permissions(&credentials)
-            .await?;
-
-        Ok((jira_projects, confluence_spaces))
     }
 
     pub async fn ensure_webhook_registered(
@@ -629,19 +531,21 @@ impl SyncManager {
         let webhook_id = self.client.register_webhook(creds, &full_url).await?;
         info!("Registered webhook {} for source {}", webhook_id, source_id);
 
+        // Preserve other state fields — run_sync writes page versions and
+        // last_successful_sync_at, which we must not clobber from this path.
         let new_state = AtlassianConnectorState {
             webhook_id: Some(webhook_id),
+            ..state
         };
-        let state_value = serde_json::to_value(&new_state)?;
         self.sdk_client
-            .save_connector_state(source_id, state_value)
+            .save_connector_state(source_id, serde_json::to_value(&new_state)?)
             .await?;
 
         Ok(())
     }
 
     pub async fn handle_webhook_event(
-        &mut self,
+        &self,
         source_id: &str,
         event: AtlassianWebhookEvent,
     ) -> Result<()> {
@@ -652,77 +556,47 @@ impl SyncManager {
 
         match event.webhook_event.as_str() {
             "jira:issue_deleted" => {
-                if let Some(issue) = &event.issue {
-                    let project_key = issue
-                        .fields
-                        .as_ref()
-                        .and_then(|f| f.project.as_ref())
-                        .map(|p| p.key.as_str())
-                        .unwrap_or("");
+                let Some(issue) = &event.issue else {
+                    return Ok(());
+                };
+                let project_key = issue
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.project.as_ref())
+                    .map(|p| p.key.as_str())
+                    .unwrap_or("");
 
-                    if project_key.is_empty() {
-                        warn!("Cannot delete issue without project key");
-                        return Ok(());
-                    }
-
-                    let sync_run_id = self
-                        .sdk_client
-                        .create_sync_run(source_id, SyncType::Incremental)
-                        .await?;
-
-                    let result = self
-                        .jira_processor
-                        .delete_issue(source_id, &sync_run_id, project_key, &issue.key)
-                        .await;
-
-                    match &result {
-                        Ok(_) => {
-                            self.sdk_client.increment_scanned(&sync_run_id, 1).await?;
-                            self.sdk_client.increment_updated(&sync_run_id, 1).await?;
-                            self.sdk_client.complete(&sync_run_id).await?
-                        }
-                        Err(e) => self.sdk_client.fail(&sync_run_id, &e.to_string()).await?,
-                    }
-                    result
-                } else {
-                    Ok(())
+                if project_key.is_empty() {
+                    warn!("Cannot delete issue without project key");
+                    return Ok(());
                 }
+
+                self.emit_delete(
+                    source_id,
+                    format!("jira_issue_{}_{}", project_key, issue.key),
+                )
+                .await
             }
             "page_removed" | "page_trashed" => {
-                if let Some(page) = &event.page {
-                    let space_key = page
-                        .space_key
-                        .as_deref()
-                        .or_else(|| page.space.as_ref().map(|s| s.key.as_str()))
-                        .unwrap_or("");
+                let Some(page) = &event.page else {
+                    return Ok(());
+                };
+                let space_key = page
+                    .space_key
+                    .as_deref()
+                    .or_else(|| page.space.as_ref().map(|s| s.key.as_str()))
+                    .unwrap_or("");
 
-                    if space_key.is_empty() {
-                        warn!("Cannot delete page without space key");
-                        return Ok(());
-                    }
-
-                    let sync_run_id = self
-                        .sdk_client
-                        .create_sync_run(source_id, SyncType::Incremental)
-                        .await?;
-
-                    let result = self
-                        .confluence_processor
-                        .delete_page(source_id, &sync_run_id, space_key, &page.id)
-                        .await;
-
-                    match &result {
-                        Ok(_) => {
-                            self.sdk_client.increment_scanned(&sync_run_id, 1).await?;
-                            self.sdk_client.increment_updated(&sync_run_id, 1).await?;
-                            self.sdk_client.complete(&sync_run_id).await?
-                        }
-                        Err(e) => self.sdk_client.fail(&sync_run_id, &e.to_string()).await?,
-                    }
-                    result
-                } else {
-                    Ok(())
+                if space_key.is_empty() {
+                    warn!("Cannot delete page without space key");
+                    return Ok(());
                 }
+
+                self.emit_delete(
+                    source_id,
+                    format!("confluence_page_{}_{}", space_key, page.id),
+                )
+                .await
             }
             "jira:issue_created" | "jira:issue_updated" | "page_created" | "page_updated" => {
                 self.sdk_client
@@ -737,7 +611,42 @@ impl SyncManager {
         }
     }
 
-    pub async fn ensure_webhooks_for_all_sources(&mut self) {
+    /// Create a one-off sync run, emit a single DocumentDeleted event, and
+    /// close the run. Used by webhook-driven deletes.
+    async fn emit_delete(&self, source_id: &str, document_id: String) -> Result<()> {
+        let sync_run_id = self
+            .sdk_client
+            .create_sync_run(source_id, SyncType::Incremental)
+            .await?;
+
+        let event = ConnectorEvent::DocumentDeleted {
+            sync_run_id: sync_run_id.clone(),
+            source_id: source_id.to_string(),
+            document_id,
+        };
+
+        let result = self
+            .sdk_client
+            .emit_event(&sync_run_id, source_id, event)
+            .await
+            .map_err(Into::into);
+
+        match &result {
+            Ok(_) => {
+                self.sdk_client.increment_scanned(&sync_run_id, 1).await?;
+                self.sdk_client.increment_updated(&sync_run_id, 1).await?;
+                self.sdk_client.complete(&sync_run_id).await?;
+            }
+            Err(e) => {
+                self.sdk_client
+                    .fail(&sync_run_id, &format!("{}", e))
+                    .await?;
+            }
+        }
+        result
+    }
+
+    pub async fn ensure_webhooks_for_all_sources(&self) {
         let source_types = ["confluence", "jira"];
 
         for source_type in &source_types {
@@ -759,7 +668,7 @@ impl SyncManager {
                     }
                 };
 
-                let (base_url, user_email, api_token) =
+                let (domain, sa_token, _org_id, _org_admin_api_key) =
                     match self.extract_atlassian_credentials(&service_creds) {
                         Ok(c) => c,
                         Err(e) => {
@@ -769,7 +678,7 @@ impl SyncManager {
                     };
 
                 let creds = match self
-                    .get_or_validate_credentials(&base_url, &user_email, &api_token, None)
+                    .get_or_validate_credentials(&domain, &sa_token, None)
                     .await
                 {
                     Ok(c) => c,

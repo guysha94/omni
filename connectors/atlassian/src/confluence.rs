@@ -1,44 +1,309 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::stream::StreamExt;
-use redis::Client as RedisClient;
-use shared::models::{ConnectorEvent, SyncType};
-use std::sync::atomic::{AtomicBool, Ordering};
+use omni_connector_sdk::{DocumentPermissions, SdkClient, SyncContext};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AtlassianCredentials;
-use crate::client::AtlassianApi;
+use crate::client::{AtlassianApi, PageReadRestrictions};
 use crate::models::{ConfluencePage, ConfluencePageStatus, ConfluenceSpace};
-use crate::sync::SyncState;
-use shared::SdkClient;
+use crate::user_resolver::UserResolver;
 
 pub struct ConfluenceProcessor {
     client: Arc<dyn AtlassianApi>,
     sdk_client: SdkClient,
-    sync_state: SyncState,
+    user_resolver: Arc<UserResolver>,
+    space_permissions_cache: DashMap<String, DocumentPermissions>,
+    /// groupId → display_name for groups encountered in space permissions
+    /// during this sync. Drained at end of sync by SyncManager so it can
+    /// emit one GroupMembershipSync event per encountered group.
+    encountered_groups: DashMap<String, Option<String>>,
+    /// Last-indexed version per page, keyed by `{space_id}:{page_id}`. Seeded
+    /// from connector state at sync start; the SyncManager drains this into
+    /// the new state after a successful run.
+    page_versions: DashMap<String, i32>,
+}
+
+fn page_version_key(space_id: &str, page_id: &str) -> String {
+    format!("{}:{}", space_id, page_id)
 }
 
 impl ConfluenceProcessor {
-    pub fn new(
+    pub fn new(client: Arc<dyn AtlassianApi>, sdk_client: SdkClient) -> Self {
+        let resolver = Arc::new(UserResolver::new(client.clone(), Arc::new(HashMap::new())));
+        Self::with_page_versions_and_resolver(client, sdk_client, HashMap::new(), resolver)
+    }
+
+    pub fn with_page_versions(
         client: Arc<dyn AtlassianApi>,
         sdk_client: SdkClient,
-        redis_client: RedisClient,
+        page_versions: HashMap<String, i32>,
+    ) -> Self {
+        let resolver = Arc::new(UserResolver::new(client.clone(), Arc::new(HashMap::new())));
+        Self::with_page_versions_and_resolver(client, sdk_client, page_versions, resolver)
+    }
+
+    pub fn with_page_versions_and_resolver(
+        client: Arc<dyn AtlassianApi>,
+        sdk_client: SdkClient,
+        page_versions: HashMap<String, i32>,
+        user_resolver: Arc<UserResolver>,
     ) -> Self {
         Self {
             client,
             sdk_client,
-            sync_state: SyncState::new(redis_client),
+            user_resolver,
+            space_permissions_cache: DashMap::new(),
+            encountered_groups: DashMap::new(),
+            page_versions: page_versions.into_iter().collect(),
         }
     }
 
+    /// Drain the current version map into a plain HashMap so the SyncManager
+    /// can persist it on the connector state after a successful sync.
+    pub fn drain_page_versions(&self) -> HashMap<String, i32> {
+        self.page_versions
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
+    /// Drain the set of groupIds encountered in space permissions during the
+    /// sync so the SyncManager can fetch their members and emit one
+    /// GroupMembershipSync event per group.
+    pub fn drain_encountered_groups(&self) -> HashMap<String, Option<String>> {
+        self.encountered_groups
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Resolve a page's effective `DocumentPermissions`. If the page has read
+    /// restrictions configured, those restrictions REPLACE the space-level
+    /// perms (Atlassian semantics: page restrictions narrow access to
+    /// specifically listed users/groups, regardless of broader space perms).
+    async fn resolve_page_permissions(
+        &self,
+        creds: &AtlassianCredentials,
+        page_id: &str,
+        space_perms: DocumentPermissions,
+    ) -> DocumentPermissions {
+        let restrictions = match self
+            .client
+            .get_confluence_page_read_restrictions(creds, page_id)
+            .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => return space_perms,
+            Err(e) => {
+                warn!(
+                    "Failed to fetch read restrictions for page {}; falling back to space perms: {}",
+                    page_id, e
+                );
+                return space_perms;
+            }
+        };
+
+        let PageReadRestrictions {
+            user_account_ids,
+            group_ids,
+        } = restrictions;
+
+        // The Atlassian API silently includes the service account in every
+        // restriction because the API caller must retain read access. The SA
+        // is not a meaningful permission grant for end-user authz, so we strip
+        // it before storing.
+        let sa_account_id = creds.sa_account_id.as_deref();
+        let user_account_ids: Vec<String> = user_account_ids
+            .into_iter()
+            .filter(|id| Some(id.as_str()) != sa_account_id)
+            .collect();
+
+        let mut user_emails = Vec::new();
+        if !user_account_ids.is_empty() {
+            match self
+                .user_resolver
+                .resolve_emails(creds, &user_account_ids)
+                .await
+            {
+                Ok(pairs) => user_emails.extend(pairs.into_iter().map(|(_, e)| e)),
+                Err(e) => warn!(
+                    "Failed to resolve restriction user emails for page {}: {}",
+                    page_id, e
+                ),
+            }
+        }
+
+        if !user_account_ids.is_empty() && user_emails.is_empty() {
+            warn!(
+                "Page {} has individual user restrictions but none could be resolved to emails. \
+                 The page will be treated as private in Omni. \
+                 Configure an org-admin API key to resolve user emails.",
+                page_id
+            );
+        }
+
+        for group_id in &group_ids {
+            self.encountered_groups
+                .entry(group_id.clone())
+                .or_insert(None);
+        }
+
+        user_emails.sort();
+        user_emails.dedup();
+
+        // FIXME(groups-key-rename): we're storing an Atlassian groupId in the
+        // `groups.email` column. Rename that column (and the GroupMembershipSync
+        // `group_email` field) to a generic identifier so non-email-keyed group
+        // systems are supported first-class.
+        DocumentPermissions {
+            public: false,
+            users: user_emails,
+            groups: group_ids,
+        }
+    }
+
+    async fn get_space_permissions(
+        &self,
+        creds: &AtlassianCredentials,
+        space_id: &str,
+    ) -> DocumentPermissions {
+        if let Some(cached) = self.space_permissions_cache.get(space_id) {
+            return cached.clone();
+        }
+
+        let perms = match self.fetch_space_permissions(creds, space_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "Failed to fetch permissions for space {}, defaulting to public: {}",
+                    space_id, e
+                );
+                DocumentPermissions {
+                    public: true,
+                    users: vec![],
+                    groups: vec![],
+                }
+            }
+        };
+
+        self.space_permissions_cache
+            .insert(space_id.to_string(), perms.clone());
+        perms
+    }
+
+    async fn fetch_space_permissions(
+        &self,
+        creds: &AtlassianCredentials,
+        space_id: &str,
+    ) -> Result<DocumentPermissions> {
+        // TODO(perms): No domain-restriction check — if the Atlassian org limits
+        // a space to a specific email domain we don't enforce that here.
+        let permissions = self
+            .client
+            .get_confluence_space_permissions(creds, space_id)
+            .await?;
+
+        // Filter for read permissions on the space
+        let read_perms: Vec<_> = permissions
+            .iter()
+            .filter(|p| p.operation.key == "read" && p.operation.target_type == "space")
+            .collect();
+
+        // If no explicit read permissions are returned, the space is likely open to all
+        // org members (Confluence Cloud default). Safer to over-expose than silently hide.
+        //
+        // TODO(perms): This conflates "no perms" with "public". We should call
+        // the space-settings endpoint to distinguish "open to all org members"
+        // from "anonymous access enabled" from "inheritance-only".
+        if read_perms.is_empty() {
+            debug!(
+                "No read permissions found for space {}, marking as public",
+                space_id
+            );
+            return Ok(DocumentPermissions {
+                public: true,
+                users: vec![],
+                groups: vec![],
+            });
+        }
+
+        let mut account_ids = Vec::new();
+        let mut group_ids = Vec::new();
+        let mut anonymous_allowed = false;
+
+        for perm in &read_perms {
+            match perm.principal.principal_type.as_str() {
+                "user" => {
+                    account_ids.push(perm.principal.id.clone());
+                }
+                "group" => {
+                    group_ids.push(perm.principal.id.clone());
+                }
+                "anonymous" | "unknown_user" => {
+                    // The v2 space-permissions API returns "anonymous" as a
+                    // principal type when the space is configured to allow
+                    // anonymous read access.
+                    anonymous_allowed = true;
+                }
+                _ => {}
+            }
+        }
+
+        account_ids.sort();
+        account_ids.dedup();
+
+        let mut user_emails = Vec::new();
+        if !account_ids.is_empty() {
+            match self.user_resolver.resolve_emails(creds, &account_ids).await {
+                Ok(id_email_pairs) => {
+                    user_emails.extend(id_email_pairs.into_iter().map(|(_, email)| email));
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve user emails for space {}: {}",
+                        space_id, e
+                    );
+                }
+            }
+        }
+
+        user_emails.sort();
+        user_emails.dedup();
+
+        group_ids.sort();
+        group_ids.dedup();
+
+        // Confluence's space-permissions endpoint doesn't return a display
+        // name on the group principal, so we record None and let the indexer
+        // store the group keyed only by its id.
+        for group_id in &group_ids {
+            self.encountered_groups
+                .entry(group_id.clone())
+                .or_insert(None);
+        }
+
+        // FIXME(groups-key-rename): we're storing an Atlassian groupId in the
+        // `groups.email` column. Rename that column (and the GroupMembershipSync
+        // `group_email` field) to a generic identifier so non-email-keyed group
+        // systems are supported first-class.
+        Ok(DocumentPermissions {
+            public: anonymous_allowed,
+            users: user_emails,
+            groups: group_ids,
+        })
+    }
+
     pub async fn sync_all_spaces_incremental(
-        &mut self,
+        &self,
         creds: &AtlassianCredentials,
         source_id: &str,
         sync_run_id: &str,
         last_sync: DateTime<Utc>,
-        cancelled: &AtomicBool,
+        ctx: &SyncContext,
         space_filters: &Option<Vec<String>>,
     ) -> Result<u32> {
         info!(
@@ -67,43 +332,36 @@ impl ConfluenceProcessor {
         }
 
         let mut total_pages_processed = 0;
-        let mut pages_batch = Vec::with_capacity(100);
 
-        let mut stream = self.client.search_confluence_pages_by_cql(creds, &cql);
-
-        while let Some(result) = stream.next().await {
-            if cancelled.load(Ordering::SeqCst) {
-                info!(
-                    "Confluence incremental sync {} cancelled after {} pages",
-                    sync_run_id, total_pages_processed
-                );
-                return Ok(total_pages_processed);
-            }
-
-            let cql_page = result?;
-            if let Some(page) = cql_page.into_confluence_page() {
-                pages_batch.push(page);
-            }
-
-            if pages_batch.len() >= 100 {
-                let count = self
-                    .process_pages(pages_batch, source_id, sync_run_id, &creds.base_url)
-                    .await?;
-                total_pages_processed += count;
-                if let Err(e) = self
-                    .sdk_client
-                    .increment_scanned(sync_run_id, count as i32)
-                    .await
-                {
-                    error!("Failed to increment scanned count: {}", e);
+        // Collect all pages first to avoid borrow conflicts with process_pages
+        let mut all_pages = Vec::new();
+        {
+            let mut stream = self.client.search_confluence_pages_by_cql(creds, &cql);
+            while let Some(result) = stream.next().await {
+                if ctx.is_cancelled() {
+                    info!(
+                        "Confluence incremental sync {} cancelled after {} pages",
+                        sync_run_id, total_pages_processed
+                    );
+                    return Ok(total_pages_processed);
                 }
-                pages_batch = Vec::with_capacity(100);
+
+                let cql_page = result?;
+                if let Some(page) = cql_page.into_confluence_page() {
+                    all_pages.push(page);
+                }
             }
         }
 
-        if !pages_batch.is_empty() {
+        for batch in all_pages.chunks(100) {
             let count = self
-                .process_pages(pages_batch, source_id, sync_run_id, &creds.base_url)
+                .process_pages(
+                    batch.to_vec(),
+                    source_id,
+                    sync_run_id,
+                    &creds.site_base(),
+                    creds,
+                )
                 .await?;
             total_pages_processed += count;
             if let Err(e) = self
@@ -123,11 +381,11 @@ impl ConfluenceProcessor {
     }
 
     pub async fn sync_all_spaces(
-        &mut self,
+        &self,
         creds: &AtlassianCredentials,
         source_id: &str,
         sync_run_id: &str,
-        cancelled: &AtomicBool,
+        ctx: &SyncContext,
         space_filters: &Option<Vec<String>>,
     ) -> Result<u32> {
         info!(
@@ -154,7 +412,7 @@ impl ConfluenceProcessor {
         let mut total_pages_processed = 0;
 
         for space in spaces {
-            if cancelled.load(Ordering::SeqCst) {
+            if ctx.is_cancelled() {
                 info!(
                     "Confluence sync {} cancelled, stopping early after {} pages",
                     sync_run_id, total_pages_processed
@@ -168,7 +426,7 @@ impl ConfluenceProcessor {
             );
 
             match self
-                .sync_space_pages(creds, source_id, sync_run_id, &space.id, cancelled)
+                .sync_space_pages(creds, source_id, sync_run_id, &space.id, ctx)
                 .await
             {
                 Ok(pages_count) => {
@@ -196,42 +454,42 @@ impl ConfluenceProcessor {
     }
 
     async fn sync_space_pages(
-        &mut self,
+        &self,
         creds: &AtlassianCredentials,
         source_id: &str,
         sync_run_id: &str,
         space_id: &str,
-        cancelled: &AtomicBool,
+        ctx: &SyncContext,
     ) -> Result<u32> {
         let mut total_pages = 0;
-        let mut pages_batch = Vec::with_capacity(100);
 
         info!("Fetching pages for Confluence space {}", space_id);
-        let mut pages_stream = self.client.get_confluence_pages(creds, space_id);
 
-        while let Some(page_result) = pages_stream.next().await {
-            if cancelled.load(Ordering::SeqCst) {
-                info!(
-                    "Confluence sync cancelled during space {} page streaming",
-                    space_id
-                );
-                return Ok(total_pages);
-            }
-            let page = page_result?;
-            pages_batch.push(page);
-
-            if pages_batch.len() >= 100 {
-                let count = self
-                    .process_pages(pages_batch, source_id, sync_run_id, &creds.base_url)
-                    .await?;
-                total_pages += count;
-                pages_batch = Vec::with_capacity(100);
+        // Collect all pages first to avoid borrow conflicts with process_pages
+        let mut all_pages = Vec::new();
+        {
+            let mut pages_stream = self.client.get_confluence_pages(creds, space_id);
+            while let Some(page_result) = pages_stream.next().await {
+                if ctx.is_cancelled() {
+                    info!(
+                        "Confluence sync cancelled during space {} page streaming",
+                        space_id
+                    );
+                    return Ok(total_pages);
+                }
+                all_pages.push(page_result?);
             }
         }
 
-        if !pages_batch.is_empty() {
+        for batch in all_pages.chunks(100) {
             let count = self
-                .process_pages(pages_batch, source_id, sync_run_id, &creds.base_url)
+                .process_pages(
+                    batch.to_vec(),
+                    source_id,
+                    sync_run_id,
+                    &creds.site_base(),
+                    creds,
+                )
                 .await?;
             total_pages += count;
         }
@@ -244,12 +502,19 @@ impl ConfluenceProcessor {
     }
 
     async fn get_accessible_spaces(
-        &mut self,
+        &self,
         creds: &AtlassianCredentials,
     ) -> Result<Vec<ConfluenceSpace>> {
-        let spaces = self.client.get_confluence_spaces(creds).await?;
+        let all_spaces = self.client.get_confluence_spaces(creds).await?;
+        // Personal spaces ("~accountId" keyed) are user scratchpads; the
+        // permission model there isn't meaningful for org-wide indexing and
+        // the noise outweighs the value.
+        let spaces: Vec<ConfluenceSpace> = all_spaces
+            .into_iter()
+            .filter(|s| s.r#type != "personal")
+            .collect();
         if spaces.is_empty() {
-            debug!("No spaces found for Confluence instance {}", creds.base_url);
+            debug!("No spaces found for Confluence instance {}", creds.domain);
         }
         debug!("Found {} accessible Confluence spaces", spaces.len());
         Ok(spaces)
@@ -261,6 +526,7 @@ impl ConfluenceProcessor {
         source_id: &str,
         sync_run_id: &str,
         base_url: &str,
+        creds: &AtlassianCredentials,
     ) -> Result<u32> {
         let mut count = 0;
 
@@ -271,14 +537,13 @@ impl ConfluenceProcessor {
                 continue;
             }
 
-            // Check if page version has changed
+            // Skip pages whose version hasn't changed since the last
+            // successful sync (state seeded in-memory at sync start).
             let current_version = page.version.number;
-            let should_process = match self
-                .sync_state
-                .get_confluence_page_version(source_id, &page.space_id, &page.id)
-                .await
-            {
-                Ok(Some(last_version)) => {
+            let version_key = page_version_key(&page.space_id, &page.id);
+            let should_process = match self.page_versions.get(&version_key) {
+                Some(entry) => {
+                    let last_version = *entry;
                     if last_version != current_version {
                         debug!(
                             "Page {} has been updated (was version {}, now version {})",
@@ -293,15 +558,8 @@ impl ConfluenceProcessor {
                         false
                     }
                 }
-                Ok(None) => {
+                None => {
                     debug!("Page {} is new, will process", page.title);
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to get sync state for page {}: {}, will process",
-                        page.id, e
-                    );
                     true
                 }
             };
@@ -336,11 +594,17 @@ impl ConfluenceProcessor {
                 }
             };
 
+            let space_perms = self.get_space_permissions(creds, &page.space_id).await;
+            let permissions = self
+                .resolve_page_permissions(creds, &page.id, space_perms)
+                .await;
+
             let event = page.to_connector_event(
                 sync_run_id.to_string(),
                 source_id.to_string(),
                 base_url,
                 content_id,
+                permissions,
             );
 
             // Emit event via SDK
@@ -358,124 +622,9 @@ impl ConfluenceProcessor {
 
             count += 1;
 
-            // Update sync state
-            if let Err(e) = self
-                .sync_state
-                .set_confluence_page_version(source_id, &page.space_id, &page.id, current_version)
-                .await
-            {
-                warn!("Failed to update sync state for page {}: {}", page.id, e);
-            }
+            self.page_versions.insert(version_key, current_version);
         }
 
         Ok(count)
-    }
-
-    pub async fn sync_single_page(
-        &mut self,
-        creds: &AtlassianCredentials,
-        source_id: &str,
-        page_id: &str,
-    ) -> Result<()> {
-        info!("Syncing single Confluence page: {}", page_id);
-
-        let expand = vec![
-            "body.storage",
-            "space",
-            "version",
-            "ancestors",
-            "_links.webui",
-        ];
-
-        let page = self
-            .client
-            .get_confluence_page_by_id(creds, page_id, &expand)
-            .await?;
-
-        if page.status != ConfluencePageStatus::Current {
-            warn!(
-                "Page {} is not current (status: {:?}), skipping",
-                page_id, page.status
-            );
-            return Ok(());
-        }
-
-        let content = page.extract_plain_text();
-        if content.trim().is_empty() {
-            warn!("Page {} has no content, skipping", page_id);
-            return Ok(());
-        }
-
-        // Create sync run via SDK
-        let sync_run_id = self
-            .sdk_client
-            .create_sync_run(source_id, SyncType::Incremental)
-            .await
-            .map_err(|e| anyhow!("Failed to create sync run via SDK: {}", e))?;
-
-        let result: Result<()> = async {
-            let content_id = self
-                .sdk_client
-                .store_content(&sync_run_id, &content)
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed to store content via SDK for Confluence page {}: {}",
-                        page.title,
-                        e
-                    )
-                })?;
-
-            let event = page.to_connector_event(
-                sync_run_id.clone(),
-                source_id.to_string(),
-                &creds.base_url,
-                content_id,
-            );
-            self.sdk_client
-                .emit_event(&sync_run_id, source_id, event)
-                .await?;
-
-            info!("Successfully queued page: {}", page.title);
-            Ok(())
-        }
-        .await;
-
-        // Mark sync as completed or failed
-        match &result {
-            Ok(_) => {
-                self.sdk_client.increment_scanned(&sync_run_id, 1).await?;
-                self.sdk_client.increment_updated(&sync_run_id, 1).await?;
-                self.sdk_client.complete(&sync_run_id).await?;
-            }
-            Err(e) => {
-                self.sdk_client.fail(&sync_run_id, &e.to_string()).await?;
-            }
-        }
-
-        result
-    }
-
-    pub async fn delete_page(
-        &self,
-        source_id: &str,
-        sync_run_id: &str,
-        space_key: &str,
-        page_id: &str,
-    ) -> Result<()> {
-        info!("Deleting Confluence page: {}", page_id);
-
-        let document_id = format!("confluence_page_{}_{}", space_key, page_id);
-        let event = ConnectorEvent::DocumentDeleted {
-            sync_run_id: sync_run_id.to_string(),
-            source_id: source_id.to_string(),
-            document_id,
-        };
-
-        self.sdk_client
-            .emit_event(sync_run_id, source_id, event)
-            .await?;
-        info!("Successfully queued deletion for page: {}", page_id);
-        Ok(())
     }
 }
