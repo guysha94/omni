@@ -1,5 +1,5 @@
 use crate::client::{build_connector_url, SdkClient, SdkError};
-use crate::connector::Connector;
+use crate::connector::{Connector, SyncRequestValidationError};
 use crate::context::SyncContext;
 use crate::mcp_adapter::{McpAdapter, McpCredentials, McpServer};
 use crate::models::{
@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use shared::models::SyncSlotClass;
 use shared::telemetry;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::time::{interval, Duration};
 use tower::ServiceBuilder;
@@ -66,6 +66,7 @@ type ActiveSyncs = Arc<DashMap<SlotKey, ActiveSync>>;
 struct ActiveSyncGuard {
     active_syncs: ActiveSyncs,
     slot_key: SlotKey,
+    sync_run_id: String,
 }
 
 impl ActiveSyncGuard {
@@ -83,7 +84,7 @@ impl ActiveSyncGuard {
             Entry::Occupied(_) => false,
             Entry::Vacant(vacant) => {
                 vacant.insert(ActiveSync {
-                    sync_run_id,
+                    sync_run_id: sync_run_id.clone(),
                     cancelled,
                 });
                 true
@@ -93,6 +94,7 @@ impl ActiveSyncGuard {
             Some(Self {
                 active_syncs,
                 slot_key,
+                sync_run_id,
             })
         } else {
             None
@@ -102,7 +104,9 @@ impl ActiveSyncGuard {
 
 impl Drop for ActiveSyncGuard {
     fn drop(&mut self) {
-        self.active_syncs.remove(&self.slot_key);
+        self.active_syncs.remove_if(&self.slot_key, |_, sync| {
+            sync.sync_run_id == self.sync_run_id
+        });
     }
 }
 
@@ -339,24 +343,6 @@ where
         source_id, sync_run_id
     );
 
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let slot_class = request.sync_mode.slot_class();
-    let Some(guard) = ActiveSyncGuard::reserve(
-        Arc::clone(&state.active_syncs),
-        source_id.clone(),
-        slot_class,
-        sync_run_id.clone(),
-        Arc::clone(&cancelled),
-    ) else {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(SyncResponse::error(format!(
-                "{} sync already in progress for this source",
-                slot_class
-            ))),
-        ));
-    };
-
     let source = state
         .sdk_client
         .get_source(&source_id)
@@ -404,6 +390,37 @@ where
                 )
             },
         )?;
+
+    state
+        .connector
+        .validate_sync_request(&source, credentials.as_ref(), request.sync_mode)
+        .await
+        .map_err(|error| match error {
+            SyncRequestValidationError::Unavailable(message) => {
+                (StatusCode::NOT_FOUND, Json(SyncResponse::error(message)))
+            }
+            SyncRequestValidationError::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, Json(SyncResponse::error(message)))
+            }
+        })?;
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let slot_class = request.sync_mode.slot_class();
+    let Some(guard) = ActiveSyncGuard::reserve(
+        Arc::clone(&state.active_syncs),
+        source_id.clone(),
+        slot_class,
+        sync_run_id.clone(),
+        Arc::clone(&cancelled),
+    ) else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(SyncResponse::error(format!(
+                "{} sync already in progress for this source",
+                slot_class
+            ))),
+        ));
+    };
 
     // Bootstrap MCP discovery now that we have credentials. Populates the
     // adapter's cache so subsequent /manifest reads (which run without creds)
@@ -464,21 +481,31 @@ where
 {
     info!("Cancel requested for sync {}", request.sync_run_id);
 
-    for sync in state.active_syncs.iter() {
-        if sync.sync_run_id == request.sync_run_id {
-            sync.cancelled
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = state.connector.cancel(&request.sync_run_id).await;
+    let matching_sync = state
+        .active_syncs
+        .iter()
+        .find(|sync| sync.sync_run_id == request.sync_run_id)
+        .map(|sync| (sync.key().clone(), Arc::clone(&sync.cancelled)));
 
-            return Json(CancelResponse {
-                status: "cancelled".to_string(),
-            });
-        }
-    }
+    let Some((slot_key, cancelled)) = matching_sync else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(CancelResponse {
+                status: "not_found".to_string(),
+            }),
+        );
+    };
 
-    Json(CancelResponse {
-        status: "not_found".to_string(),
-    })
+    cancelled.store(true, Ordering::SeqCst);
+    state.active_syncs.remove(&slot_key);
+    let _ = state.connector.cancel(&request.sync_run_id).await;
+
+    (
+        StatusCode::OK,
+        Json(CancelResponse {
+            status: "cancelled".to_string(),
+        }),
+    )
 }
 
 async fn execute_action<C>(

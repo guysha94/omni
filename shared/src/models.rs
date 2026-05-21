@@ -630,6 +630,7 @@ impl std::fmt::Display for SyncSlotClass {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
 #[sqlx(type_name = "varchar", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum SyncStatus {
     Running,
     Completed,
@@ -647,6 +648,7 @@ pub struct SyncRun {
     #[serde(with = "time::serde::iso8601::option")]
     pub completed_at: Option<OffsetDateTime>,
     pub status: SyncStatus,
+    pub trigger_type: String,
     pub documents_scanned: i32,
     pub documents_processed: i32,
     pub documents_updated: i32,

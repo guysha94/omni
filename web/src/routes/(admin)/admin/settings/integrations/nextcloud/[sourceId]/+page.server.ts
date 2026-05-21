@@ -114,10 +114,7 @@ export const actions: Actions = {
                         headers: { 'Content-Type': 'application/json' },
                     })
                 } catch (err) {
-                    console.error(
-                        `Failed to trigger sync for Nextcloud source ${source.id}:`,
-                        err,
-                    )
+                    console.error(`Failed to trigger sync for Nextcloud source ${source.id}:`, err)
                 }
             }
         } catch (err) {

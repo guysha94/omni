@@ -1,9 +1,10 @@
 use crate::connector_client::ConnectorClient;
 use crate::models::{
     ActionRequest, ConnectorInfo, ExecuteActionRequest, ExecutePromptRequest,
-    ExecuteResourceRequest, PromptRequest, ResourceRequest, ScheduleInfo, SyncProgress,
-    TriggerSyncRequest, TriggerSyncResponse, TriggerType,
+    ExecuteResourceRequest, PromptRequest, ResourceRequest, ScheduleInfo, SourceHealth,
+    SourceSyncOverview, SyncProgress, TriggerSyncRequest, TriggerSyncResponse, TriggerType,
 };
+use crate::sync_circuit_breaker::has_failure_streak;
 use crate::sync_manager::SyncError;
 use crate::AppState;
 use axum::{
@@ -22,7 +23,8 @@ use shared::clients::docling::{DoclingClient, DoclingError};
 use shared::constants::REDIS_SYSTEM_SETTINGS_KEY;
 use shared::db::repositories::SyncRunRepository;
 use shared::models::{
-    ActionMode, ConnectorManifest, SearchOperator, ServiceProvider, SourceType, SyncType,
+    ActionMode, ConnectorManifest, SearchOperator, ServiceProvider, Source, SourceType, SyncRun,
+    SyncType,
 };
 use shared::queue::EventQueue;
 use shared::utils;
@@ -226,13 +228,86 @@ pub async fn list_schedules(
 
 pub async fn list_sources(
     State(state): State<AppState>,
-) -> Result<Json<Vec<shared::models::Source>>, ApiError> {
+) -> Result<Json<Vec<SourceSyncOverview>>, ApiError> {
     let source_repo = SourceRepository::new(state.db_pool.pool());
     let sources = source_repo
         .find_all_sources()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(sources))
+
+    Ok(Json(build_source_sync_overviews(&state, sources).await?))
+}
+
+pub async fn get_source(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+) -> Result<Json<SourceSyncOverview>, ApiError> {
+    let source_repo = SourceRepository::new(state.db_pool.pool());
+    let source = source_repo
+        .find_by_id(source_id.clone())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter(|source| !source.is_deleted)
+        .ok_or_else(|| ApiError::NotFound(format!("Source not found: {}", source_id)))?;
+
+    let mut overviews = build_source_sync_overviews(&state, vec![source]).await?;
+    let overview = overviews
+        .pop()
+        .ok_or_else(|| ApiError::NotFound(format!("Source not found: {}", source_id)))?;
+
+    Ok(Json(overview))
+}
+
+async fn build_source_sync_overviews(
+    state: &AppState,
+    sources: Vec<Source>,
+) -> Result<Vec<SourceSyncOverview>, ApiError> {
+    let sync_run_repo = SyncRunRepository::new(state.db_pool.pool());
+    let source_ids: Vec<String> = sources.iter().map(|s| s.id.clone()).collect();
+    // Fetch more than the 10 runs we return to the UI so health evaluation can
+    // ignore manual failures while still finding enough scheduled failures to
+    // make a circuit-breaker decision.
+    let sync_run_limit = state
+        .config
+        .sync_max_consecutive_failures
+        .max(10)
+        .saturating_mul(3);
+    let sync_runs = sync_run_repo
+        .list_runs_for_sync_types(
+            &source_ids,
+            &[SyncType::Full, SyncType::Incremental],
+            i64::from(sync_run_limit),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let mut runs_by_source: HashMap<String, Vec<SyncRun>> = HashMap::new();
+    for run in sync_runs {
+        runs_by_source
+            .entry(run.source_id.clone())
+            .or_default()
+            .push(run);
+    }
+
+    Ok(sources
+        .into_iter()
+        .map(|source| {
+            let sync_runs = runs_by_source.remove(&source.id).unwrap_or_default();
+            let health =
+                if has_failure_streak(&sync_runs, state.config.sync_max_consecutive_failures) {
+                    SourceHealth::Unhealthy
+                } else {
+                    SourceHealth::Healthy
+                };
+            let sync_runs = sync_runs.into_iter().take(10).collect();
+
+            SourceSyncOverview {
+                sync_runs,
+                source,
+                health,
+            }
+        })
+        .collect())
 }
 
 pub async fn list_connectors(
@@ -819,6 +894,13 @@ impl From<SyncError> for ApiError {
             SyncError::ConcurrencyLimitReached => {
                 ApiError::Conflict("Concurrency limit reached, try again later".to_string())
             }
+            SyncError::SyncModeUnavailable {
+                source_id,
+                sync_type,
+            } => ApiError::BadRequest(format!(
+                "{} sync is not available for source: {}",
+                sync_type, source_id
+            )),
             SyncError::DatabaseError(e) => ApiError::Internal(e),
             SyncError::ConnectorError(e) => ApiError::Internal(e.to_string()),
         }
