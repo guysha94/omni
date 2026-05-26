@@ -51,7 +51,7 @@ from memory import (
     user_key,
 )
 from prompts import build_agent_chat_system_prompt, build_chat_system_prompt
-from providers import LLMProvider
+from providers import LLMProvider, LLMProviderStreamError
 from services.compaction import ConversationCompactor
 from services.usage import UsageContext, UsagePurpose, UsageTracker, track_usage
 from state import AppState
@@ -80,6 +80,21 @@ Based on the first message(s) of a conversation, generate a title that is:
 - Does not include quotes or special formatting
 
 Just respond with the title text, nothing else."""
+
+
+def _chat_error_message(exc: Exception) -> str:
+    if isinstance(exc, LLMProviderStreamError) and exc.message:
+        return f"Failed to generate response: {exc.message}"
+
+    message = str(exc).strip()
+    if message:
+        return f"Failed to generate response: {message}"
+
+    return "Failed to generate response. Please try again."
+
+
+def _sse_event(event_type: str, data: object) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
 def _resolve_provider(state: AppState, model_id: str | None) -> LLMProvider:
@@ -1261,7 +1276,7 @@ async def stream_chat(
             logger.error(
                 f"Failed to generate AI response with tools: {e}", exc_info=True
             )
-            yield "event: error\ndata: Something went wrong, please try again later.\n\n"
+            yield _sse_event("stream_error", {"message": _chat_error_message(e)})
 
     return StreamingResponse(
         stream_generator(),

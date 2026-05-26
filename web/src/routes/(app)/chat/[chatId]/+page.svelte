@@ -145,6 +145,13 @@
     let error = $state<string | null>(null)
     let eventSource: EventSource | null = $state(null)
 
+    type StreamErrorPayload = { message: string }
+
+    function streamErrorMessage(event: MessageEvent<string>): string {
+        const payload = JSON.parse(event.data) as StreamErrorPayload
+        return payload.message
+    }
+
     const defaultVerbs = ['Thinking', 'Reasoning', 'Analyzing', 'Processing']
     const slowMessages = [
         'Still working',
@@ -995,6 +1002,11 @@
             invalidate('app:recent_chats') // This will force a re-fetch of recent chats and update the title in the sidebar
         })
 
+        eventSource.addEventListener('title_error', (event) => {
+            error = streamErrorMessage(event as MessageEvent<string>)
+            requestAnimationFrame(() => recalcBottomPadding())
+        })
+
         eventSource.addEventListener('message', (event) => {
             try {
                 const data: MessageStreamEvent | ToolResultBlockParam = JSON.parse(event.data)
@@ -1131,15 +1143,21 @@
             }
         })
 
-        eventSource.addEventListener('error', (event) => {
-            error = 'Failed to generate response. Please try again.'
+        const handleStreamError = (event: Event) => {
+            error =
+                event instanceof MessageEvent
+                    ? streamErrorMessage(event as MessageEvent<string>)
+                    : 'Failed to generate response. Please try again.'
             isStreaming = false
             stopThinkingText()
             requestAnimationFrame(() => recalcBottomPadding())
             userInputRef?.focus()
             eventSource?.close()
             eventSource = null
-        })
+        }
+
+        eventSource.addEventListener('stream_error', handleStreamError)
+        eventSource.addEventListener('error', handleStreamError)
     }
 
     async function handleApproval(decision: 'approved' | 'denied') {
@@ -1629,6 +1647,14 @@
                                     isAdmin={data.user.role === 'admin'}
                                     onOAuthComplete={() => streamResponse(data.chat.id)} />
                             </div>
+                            {#if error && i === processedMessages.length - 1}
+                                <div class="flex px-2">
+                                    <Alert.Root variant="destructive" title={error}>
+                                        <CircleAlert />
+                                        <Alert.Title>{error}</Alert.Title>
+                                    </Alert.Root>
+                                </div>
+                            {/if}
                             {#if pendingApproval && i === processedMessages.length - 1}
                                 {@const connectorName = pendingApproval.tool_name.split('__')[0]}
                                 {@const actionName = pendingApproval.tool_name
@@ -1716,7 +1742,7 @@
                                 {#if message.siblingIds && message.siblingIds.length > 1}
                                     {@render branchNavigation(message)}
                                 {/if}
-                                {#if !(isStreaming && i === processedMessages.length - 1)}
+                                {#if !(isStreaming && i === processedMessages.length - 1) && !(error && i === processedMessages.length - 1)}
                                     {@render messageControls(message)}
                                 {/if}
                             </div>
@@ -1725,13 +1751,12 @@
                 {/each}
 
                 <!-- Streaming AI Response -->
-                {#if isStreaming || error}
+                {#if isStreaming || (error && processedMessages[processedMessages.length - 1]?.role !== 'assistant')}
                     <div class="flex px-2">
                         {#if error}
-                            <Alert.Root variant="destructive">
+                            <Alert.Root variant="destructive" title={error}>
                                 <CircleAlert />
                                 <Alert.Title>{error}</Alert.Title>
-                                <!-- <Alert.Description>{error}</Alert.Description> -->
                             </Alert.Root>
                         {:else if isStreaming}
                             <span class="thinking-container mt-2 flex items-center gap-1.5">
