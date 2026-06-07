@@ -32,9 +32,22 @@ const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const DOCS_API_BASE: &str = "https://docs.googleapis.com/v1";
 const SHEETS_API_BASE: &str = "https://sheets.googleapis.com/v4";
 const SLIDES_API_BASE: &str = "https://slides.googleapis.com/v1";
+const DEFAULT_GOOGLE_SHEETS_MAX_INDEXED_ROWS: usize = 1000;
 
 fn drive_api_base() -> String {
     env::var("GOOGLE_DRIVE_API_BASE").unwrap_or_else(|_| DRIVE_API_BASE.to_string())
+}
+
+fn google_sheets_max_indexed_rows() -> usize {
+    env::var("GOOGLE_SHEETS_MAX_INDEXED_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .unwrap_or(DEFAULT_GOOGLE_SHEETS_MAX_INDEXED_ROWS)
+}
+
+fn escape_sheet_name_for_a1(sheet_name: &str) -> String {
+    sheet_name.replace('\'', "''")
 }
 
 #[derive(Clone)]
@@ -42,9 +55,12 @@ pub struct DriveClient {
     client: Client,
     // This rate limiter is for Drive APIs (rate limit: 12k req/min)
     rate_limiter: Arc<RateLimiter>,
-    // These rate limiters, one per user, are for Docs/Sheets etc. APIs,
-    // which have a rate limit per user of 300 req/min
+    // These rate limiters, one per user, are for Docs/Slides APIs,
+    // which have a rate limit per user of 300 req/min.
     user_rate_limiters: Arc<RwLock<HashMap<String, Arc<RateLimiter>>>>,
+    // Sheets has a lower per-user read quota (60 req/min). Keep it separate
+    // from Docs/Slides so spreadsheet crawls cannot overrun the Sheets quota.
+    user_sheets_rate_limiters: Arc<RwLock<HashMap<String, Arc<RateLimiter>>>>,
 }
 
 impl DriveClient {
@@ -60,11 +76,13 @@ impl DriveClient {
 
         let rate_limiter = Arc::new(RateLimiter::new(200, google_max_retries())); // 12000 req/min
         let user_rate_limiters = Arc::new(RwLock::new(HashMap::new()));
+        let user_sheets_rate_limiters = Arc::new(RwLock::new(HashMap::new()));
 
         Self {
             client,
             rate_limiter,
             user_rate_limiters,
+            user_sheets_rate_limiters,
         }
     }
 
@@ -82,6 +100,7 @@ impl DriveClient {
             client,
             rate_limiter,
             user_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            user_sheets_rate_limiters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -141,13 +160,16 @@ impl DriveClient {
             let response_text = response.text().await?;
             debug!("Drive API raw response: {}", response_text);
 
-            let parsed_response = serde_json::from_str(&response_text).map_err(|e| {
-                anyhow!(
-                    "Failed to parse Drive API response: {}. Raw response: {}",
-                    e,
-                    response_text
-                )
-            })?;
+            let parsed_response = match serde_json::from_str(&response_text) {
+                Ok(parsed_response) => parsed_response,
+                Err(e) => {
+                    return Ok(ApiResult::OtherError(anyhow!(
+                        "Failed to parse Drive API response: {}. Raw response: {}",
+                        e,
+                        response_text
+                    )));
+                }
+            };
 
             Ok(ApiResult::Success(parsed_response))
             }
@@ -226,6 +248,34 @@ impl DriveClient {
         Ok(limiter)
     }
 
+    fn get_or_create_user_sheets_rate_limiter(&self, user_email: &str) -> Result<Arc<RateLimiter>> {
+        {
+            let rate_limiters = self.user_sheets_rate_limiters.read().map_err(|e| {
+                anyhow!(
+                    "Failed to acquire read lock on user Sheets rate limiters: {:?}",
+                    e
+                )
+            })?;
+            if let Some(limiter) = rate_limiters.get(user_email) {
+                return Ok(Arc::clone(limiter));
+            }
+        }
+
+        let mut rate_limiters = self.user_sheets_rate_limiters.write().map_err(|e| {
+            anyhow!(
+                "Failed to acquire write lock on user Sheets rate limiters: {:?}",
+                e
+            )
+        })?;
+
+        let limiter = rate_limiters
+            .entry(user_email.to_string())
+            .or_insert_with(|| Arc::new(RateLimiter::new(1, google_max_retries())))
+            .clone();
+
+        Ok(limiter)
+    }
+
     fn delete_user_rate_limiter(&self, user_email: &str) -> Result<()> {
         let mut rate_limiters = self.user_rate_limiters.write().map_err(|e| {
             anyhow!(
@@ -234,6 +284,15 @@ impl DriveClient {
             )
         })?;
         rate_limiters.remove(user_email);
+        drop(rate_limiters);
+
+        let mut sheets_rate_limiters = self.user_sheets_rate_limiters.write().map_err(|e| {
+            anyhow!(
+                "Failed to acquire write lock on user Sheets rate limiters: {:?}",
+                e
+            )
+        })?;
+        sheets_rate_limiters.remove(user_email);
         Ok(())
     }
 
@@ -280,13 +339,17 @@ impl DriveClient {
                     .await
                     .context("Failed to read response body from Google Docs API")?;
 
-                let doc: GoogleDocument =
-                    serde_json::from_str(&response_text).with_context(|| {
-                        format!(
-                            "Failed to parse Google Docs API response for file {}. Raw response: {}",
-                            file_id, response_text
-                        )
-                    })?;
+                let doc: GoogleDocument = match serde_json::from_str(&response_text) {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                        return Ok(ApiResult::OtherError(anyhow!(
+                            "Failed to parse Google Docs API response for file {}: {}. Raw response: {}",
+                            file_id,
+                            e,
+                            response_text
+                        )));
+                    }
+                };
 
                 Ok(ApiResult::Success(extract_text_from_document(&doc)))
             }
@@ -302,7 +365,7 @@ impl DriveClient {
     ) -> Result<String> {
         let file_id = file_id.to_string();
 
-        let rate_limiter = self.get_or_create_user_rate_limiter(user_email)?;
+        let rate_limiter = self.get_or_create_user_sheets_rate_limiter(user_email)?;
         execute_with_auth_retry(auth, user_email, rate_limiter.clone(), |token| {
             let file_id = file_id.clone();
             async move {
@@ -319,12 +382,35 @@ impl DriveClient {
                     .await;
                 }
 
-                let sheet: GoogleSpreadsheet = response.json().await?;
+                let sheet: GoogleSpreadsheet = match response.json().await {
+                    Ok(sheet) => sheet,
+                    Err(e) => {
+                        return Ok(ApiResult::OtherError(anyhow!(
+                            "Failed to parse spreadsheet metadata for {}: {}",
+                            file_id,
+                            e
+                        )));
+                    }
+                };
                 let mut content = String::new();
+                let max_indexed_rows = google_sheets_max_indexed_rows();
 
                 for sheet_info in &sheet.sheets {
                     let sheet_name = &sheet_info.properties.title;
-                    let range = format!("'{}'", sheet_name);
+                    let sheet_rows = sheet_info
+                        .properties
+                        .grid_properties
+                        .as_ref()
+                        .and_then(|properties| properties.row_count)
+                        .unwrap_or(max_indexed_rows);
+                    let rows_to_fetch = sheet_rows.min(max_indexed_rows);
+                    if rows_to_fetch == 0 {
+                        continue;
+                    }
+                    let truncated = sheet_rows > rows_to_fetch;
+
+                    let escaped_sheet_name = escape_sheet_name_for_a1(sheet_name);
+                    let range = format!("'{}'!1:{}", escaped_sheet_name, rows_to_fetch);
 
                     let values_url = format!(
                         "{}/spreadsheets/{}/values/{}",
@@ -350,12 +436,28 @@ impl DriveClient {
                         .await;
                     }
 
-                    if let Ok(values) = values_response.json::<ValueRange>().await {
-                        append_filtered_spreadsheet_sheet(
-                            &mut content,
-                            sheet_name,
-                            values.values.unwrap_or_default(),
-                        );
+                    let values = match values_response.json::<ValueRange>().await {
+                        Ok(values) => values,
+                        Err(e) => {
+                            return Ok(ApiResult::OtherError(anyhow!(
+                                "Failed to parse spreadsheet values for {} sheet {}: {}",
+                                file_id,
+                                sheet_name,
+                                e
+                            )));
+                        }
+                    };
+                    append_filtered_spreadsheet_sheet(
+                        &mut content,
+                        sheet_name,
+                        values.values.unwrap_or_default(),
+                    );
+
+                    if truncated {
+                        content.push_str(&format!(
+                            "Sheet {} truncated to first {} rows for indexing.\n\n",
+                            sheet_name, max_indexed_rows
+                        ));
                     }
                 }
 
@@ -393,14 +495,17 @@ impl DriveClient {
                 debug!("Google Slides API response status: {}", status);
                 let response_text = response.text().await?;
 
-                let presentation: GooglePresentation = serde_json::from_str(&response_text)
-                    .map_err(|e| {
-                        anyhow!(
-                            "Failed to parse Google Slides API response: {}. Raw response: {}",
+                let presentation: GooglePresentation = match serde_json::from_str(&response_text) {
+                    Ok(presentation) => presentation,
+                    Err(e) => {
+                        return Ok(ApiResult::OtherError(anyhow!(
+                            "Failed to parse Google Slides API response for file {}: {}. Raw response: {}",
+                            file_id,
                             e,
                             response_text
-                        )
-                    })?;
+                        )));
+                    }
+                };
 
                 Ok(ApiResult::Success(extract_text_from_presentation(
                     &presentation,
@@ -948,6 +1053,14 @@ struct Sheet {
 #[derive(Debug, Deserialize)]
 struct SheetProperties {
     title: String,
+    #[serde(rename = "gridProperties")]
+    grid_properties: Option<GridProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GridProperties {
+    #[serde(rename = "rowCount")]
+    row_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1134,5 +1247,36 @@ mod tests {
         append_filtered_spreadsheet_sheet(&mut content, "Budget", rows);
 
         assert_eq!(content, "Sheet: Budget\nInvoice\nQ4 revenue\n東京\n\n");
+    }
+
+    #[test]
+    fn spreadsheet_metadata_reads_sheet_row_count() {
+        let sheet: GoogleSpreadsheet = serde_json::from_str(
+            r#"{
+                "sheets": [
+                    {
+                        "properties": {
+                            "title": "Data",
+                            "gridProperties": { "rowCount": 1500 }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sheet.sheets[0]
+                .properties
+                .grid_properties
+                .as_ref()
+                .and_then(|properties| properties.row_count),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn sheet_name_escape_doubles_single_quotes_for_a1_ranges() {
+        assert_eq!(escape_sheet_name_for_a1("Bob's Sheet"), "Bob''s Sheet");
     }
 }
