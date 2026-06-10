@@ -1,5 +1,6 @@
 <script lang="ts">
     import SourceSyncHealth from '$lib/components/sources/source-sync-health.svelte'
+    import SourceSyncIntervalCard from '$lib/components/sources/source-sync-interval-card.svelte'
     import SyncRunHistory from '$lib/components/sources/sync-run-history.svelte'
     import { Button } from '$lib/components/ui/button'
     import * as Card from '$lib/components/ui/card'
@@ -31,6 +32,10 @@
 
             {@render children()}
 
+            <SourceSyncIntervalCard
+                sourceId={data.source.id}
+                syncIntervalSeconds={data.source.syncIntervalSeconds} />
+
             <SyncRunHistory runs={data.syncRuns} />
 
             <Card.Root>
@@ -39,7 +44,7 @@
                         <Card.Title>Delete Source</Card.Title>
                         <Card.Description>
                             Permanently delete this source and all its synced data, credentials, and
-                            sync history.
+                            sync history
                         </Card.Description>
                     </div>
                     <Button
