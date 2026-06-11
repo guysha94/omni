@@ -22,6 +22,16 @@ fn result_titles(response: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Extract result document IDs from a search response in order.
+fn result_document_ids(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["document"]["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
 /// Assert that scores in results are positive and in descending order.
 fn assert_scores_descending(response: &Value) {
     let results = response["results"].as_array().unwrap();
@@ -201,6 +211,13 @@ async fn test_fulltext_search() -> Result<()> {
             assert!(count > 0, "Facet count should be positive, got {}", count);
         }
     }
+    for result in response["results"].as_array().unwrap() {
+        assert_eq!(
+            result["source_type"].as_str(),
+            Some("local_files"),
+            "Fulltext results should include source_type populated by the search query"
+        );
+    }
 
     // Query 5: phrase ranking — "blue square nda"
     // BlueSquare NDA should rank first (phrase match on "blue square" in title & content).
@@ -358,6 +375,138 @@ async fn test_hybrid_search() -> Result<()> {
     );
     assert_scores_descending(&response);
 
+    let (status, page1_response) = fixture
+        .search_with_body(json!({
+            "query": "search",
+            "mode": "hybrid",
+            "limit": 2,
+            "offset": 0,
+            "include_facets": false
+        }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, page2_response) = fixture
+        .search_with_body(json!({
+            "query": "search",
+            "mode": "hybrid",
+            "limit": 2,
+            "offset": 2,
+            "include_facets": false
+        }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        page1_response["total_count"].as_i64(),
+        page2_response["total_count"].as_i64(),
+        "Hybrid total_count should not grow with offset-dependent overfetch"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_pagination_matches_fused_ranking() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let _doc_ids = fixture.seed_search_data().await?;
+
+    let base_body = |limit: i64, offset: i64| {
+        json!({
+            "query": "search",
+            "mode": "hybrid",
+            "limit": limit,
+            "offset": offset,
+            "include_facets": false
+        })
+    };
+
+    let (status, first_four) = fixture.search_with_body(base_body(4, 0)).await?;
+    assert_eq!(status, StatusCode::OK);
+    let first_four_ids = result_document_ids(&first_four);
+    assert!(
+        first_four_ids.len() >= 4,
+        "Expected at least 4 hybrid results for pagination test, got: {:?}",
+        result_titles(&first_four)
+    );
+
+    let (status, page_one) = fixture.search_with_body(base_body(2, 0)).await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, page_two) = fixture.search_with_body(base_body(2, 2)).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut combined_page_ids = result_document_ids(&page_one);
+    combined_page_ids.extend(result_document_ids(&page_two));
+    assert_eq!(
+        combined_page_ids, first_four_ids,
+        "Hybrid pages should be slices of the same fused RRF ranking"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_dedupes_after_retrievers_pick_different_duplicates() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let pool = fixture.test_env.db_pool.pool();
+    let first_source_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+    let second_source_id = Ulid::new().to_string();
+    let query = "hybridcrossdedupneedle";
+    let external_id = "hybrid-cross-retriever-duplicate";
+
+    sqlx::query(
+        r#"
+        INSERT INTO sources (id, name, source_type, config, created_by, created_at, updated_at)
+        VALUES ($1, 'Second Hybrid Dedup Source', 'local_files', '{}', '01JGF7V3E0Y2R1X8P5Q7W9T4N6', NOW(), NOW())
+        "#,
+    )
+    .bind(&second_source_id)
+    .execute(pool)
+    .await?;
+
+    insert_public_document_with_embedding(
+        pool,
+        first_source_id,
+        external_id,
+        "HybridCrossDedupNeedle Keyword Winner",
+        "hybridcrossdedupneedle hybridcrossdedupneedle hybridcrossdedupneedle",
+        "unrelated embedding text",
+        "2026-01-01T00:00:00Z",
+    )
+    .await?;
+    insert_public_document_with_embedding(
+        pool,
+        &second_source_id,
+        external_id,
+        "Semantic Duplicate Winner",
+        "semantic-only duplicate content",
+        query,
+        "2026-01-02T00:00:00Z",
+    )
+    .await?;
+
+    let (status, response) = fixture
+        .search_with_body(json!({
+            "query": query,
+            "mode": "hybrid",
+            "limit": 10,
+            "include_facets": false
+        }))
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let duplicate_results: Vec<&Value> = response["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["document"]["external_id"].as_str() == Some(external_id))
+        .collect();
+    assert_eq!(
+        duplicate_results.len(),
+        1,
+        "Hybrid should collapse duplicates even when FTS and semantic choose different physical rows: {:?}",
+        result_titles(&response)
+    );
+
     Ok(())
 }
 
@@ -404,6 +553,21 @@ async fn test_search_with_limit() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     let page2_titles = result_titles(&page2_response);
 
+    let total_count = page1_response["total_count"].as_i64().unwrap();
+    let (status, last_page_response) = fixture
+        .search_with_body(json!({
+            "query": "square",
+            "mode": "fulltext",
+            "limit": 2,
+            "offset": total_count
+        }))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !last_page_response["has_more"].as_bool().unwrap_or(true),
+        "Page starting at total_count should have has_more=false"
+    );
+
     // No overlapping titles between pages
     for title in &page1_titles {
         assert!(
@@ -414,6 +578,301 @@ async fn test_search_with_limit() -> Result<()> {
             page2_titles
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_include_facets_false_preserves_total_count() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let _doc_ids = fixture.seed_search_data().await?;
+
+    let (status, response) = fixture
+        .search_with_body(json!({
+            "query": "square",
+            "mode": "fulltext",
+            "limit": 2,
+            "offset": 0,
+            "include_facets": false
+        }))
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.get("facets").is_none(),
+        "facets should be omitted when include_facets=false: {:?}",
+        response
+    );
+    assert!(
+        response["total_count"].as_i64().unwrap() > 0,
+        "total_count should still be populated when facets are disabled"
+    );
+    assert_eq!(
+        response["has_more"].as_bool().unwrap(),
+        response["total_count"].as_i64().unwrap() > 2,
+        "has_more should use offset + limit < total_count"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_total_count_matches_relevance_filtered_fulltext_results() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let pool = fixture.test_env.db_pool.pool();
+    let content_storage = shared::ContentStorage::new(pool.clone());
+    let source_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+
+    let high_doc_id = Ulid::new().to_string();
+    let high_content = "paginationalpha paginationbeta paginationgamma paginationdelta paginationneedle. paginationalpha paginationbeta paginationgamma paginationdelta paginationneedle.";
+    let high_content_id = content_storage.store_text(high_content.to_string()).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, content, metadata, permissions, attributes, created_at, updated_at)
+        VALUES ($1, $2, 'pagination_relevance_high', 'PaginationAlpha PaginationBeta PaginationGamma PaginationDelta PaginationNeedle', $3, 'document', $4, '{}', '{"public": true, "users": [], "groups": []}', '{}', NOW(), NOW())
+        "#,
+    )
+    .bind(&high_doc_id)
+    .bind(source_id)
+    .bind(&high_content_id)
+    .bind(high_content)
+    .execute(pool)
+    .await?;
+
+    for idx in 0..30 {
+        let doc_id = Ulid::new().to_string();
+        let content = format!("paginationneedle weak match filler document number {idx}");
+        let content_id = content_storage.store_text(content.clone()).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, content, metadata, permissions, attributes, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, 'document', $6, '{}', '{"public": true, "users": [], "groups": []}', '{}', NOW(), NOW())
+            "#,
+        )
+        .bind(&doc_id)
+        .bind(source_id)
+        .bind(format!("pagination_relevance_low_{idx}"))
+        .bind(format!("Weak PaginationNeedle Match {idx}"))
+        .bind(&content_id)
+        .bind(content)
+        .execute(pool)
+        .await?;
+    }
+
+    let (status, response) = fixture
+        .search_with_body(json!({
+            "query": "paginationalpha paginationbeta paginationgamma paginationdelta paginationneedle",
+            "mode": "fulltext",
+            "limit": 10,
+            "offset": 0,
+            "include_facets": false
+        }))
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let titles = result_titles(&response);
+    assert_eq!(
+        titles,
+        vec!["PaginationAlpha PaginationBeta PaginationGamma PaginationDelta PaginationNeedle"],
+        "Weak one-term matches should be filtered from displayed results"
+    );
+    assert_eq!(
+        response["total_count"].as_i64().unwrap(),
+        titles.len() as i64,
+        "total_count should be counted after the same relevance filter as displayed hits"
+    );
+    assert!(
+        !response["has_more"].as_bool().unwrap(),
+        "Pagination should not advertise more pages after low relevance matches are filtered"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fulltext_dedupes_by_source_type_and_external_id() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let pool = fixture.test_env.db_pool.pool();
+    let content_storage = shared::ContentStorage::new(pool.clone());
+    let default_local_source_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+    let second_local_source_id = Ulid::new().to_string();
+    let google_source_id = Ulid::new().to_string();
+
+    for (source_id, name, source_type) in [
+        (
+            &second_local_source_id,
+            "Second Local Dedup Source",
+            "local_files",
+        ),
+        (&google_source_id, "Google Dedup Source", "google_drive"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO sources (id, name, source_type, config, created_by, created_at, updated_at)
+            VALUES ($1, $2, $3, '{}', '01JGF7V3E0Y2R1X8P5Q7W9T4N6', NOW(), NOW())
+            "#,
+        )
+        .bind(source_id)
+        .bind(name)
+        .bind(source_type)
+        .execute(pool)
+        .await?;
+    }
+
+    for (source_id, title, updated_at) in [
+        (
+            default_local_source_id,
+            "TypeDedupeAlpha Local Older",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            second_local_source_id.as_str(),
+            "TypeDedupeAlpha Local Newer",
+            "2026-01-02T00:00:00Z",
+        ),
+        (
+            google_source_id.as_str(),
+            "TypeDedupeAlpha Google Same External",
+            "2026-01-03T00:00:00Z",
+        ),
+    ] {
+        let doc_id = Ulid::new().to_string();
+        let content = format!("typededupealpha shared dedupe content for {title}");
+        let content_id = content_storage.store_text(content.clone()).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, content, metadata, permissions, attributes, created_at, updated_at)
+            VALUES ($1, $2, 'typededupealpha-shared', $3, $4, 'document', $5, jsonb_build_object('updated_at', $6::text), '{"public": true, "users": [], "groups": []}', '{}', $6::timestamptz, $6::timestamptz)
+            "#,
+        )
+        .bind(&doc_id)
+        .bind(source_id)
+        .bind(title)
+        .bind(&content_id)
+        .bind(content)
+        .bind(updated_at)
+        .execute(pool)
+        .await?;
+    }
+
+    let (status, response) = fixture
+        .search_with_body(json!({
+            "query": "typededupealpha",
+            "mode": "fulltext",
+            "limit": 10,
+            "include_facets": false
+        }))
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let results = response["results"].as_array().unwrap();
+    assert_eq!(
+        response["total_count"].as_i64().unwrap(),
+        2,
+        "same source_type/external_id duplicates should count once, but different source types should remain separate"
+    );
+    assert_eq!(results.len(), 2);
+
+    let titles = result_titles(&response);
+    assert!(
+        titles.contains(&"TypeDedupeAlpha Local Newer".to_string()),
+        "newer local duplicate should win within the local_files/external_id group: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"TypeDedupeAlpha Google Same External".to_string()),
+        "same external_id in a different source type should not be deduped: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"TypeDedupeAlpha Local Older".to_string()),
+        "older local duplicate should be collapsed: {titles:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unfiltered_facets_with_source_type_filter() -> Result<()> {
+    let fixture = SearcherTestFixture::new().await?;
+    let pool = fixture.test_env.db_pool.pool();
+    let content_storage = shared::ContentStorage::new(pool.clone());
+
+    let google_source_id = Ulid::new().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO sources (id, name, source_type, config, created_by, created_at, updated_at)
+        VALUES ($1, 'Google Facet Test Source', 'google_drive', '{}', '01JGF7V3E0Y2R1X8P5Q7W9T4N6', NOW(), NOW())
+        "#,
+    )
+    .bind(&google_source_id)
+    .execute(pool)
+    .await?;
+
+    for (source_id, external_id, title) in [
+        (
+            "01JGF7V3E0Y2R1X8P5Q7W9T4N7".to_string(),
+            "facetglobal_local",
+            "Local Facetglobal Plan",
+        ),
+        (
+            google_source_id,
+            "facetglobal_google",
+            "Google Facetglobal Plan",
+        ),
+    ] {
+        let doc_id = Ulid::new().to_string();
+        let content = "facetglobal roadmap planning document for source facet tests";
+        let content_id = content_storage.store_text(content.to_string()).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, content, metadata, permissions, attributes, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, 'document', $6, '{}', '{"public": true, "users": [], "groups": []}', '{}', NOW(), NOW())
+            "#,
+        )
+        .bind(&doc_id)
+        .bind(&source_id)
+        .bind(external_id)
+        .bind(title)
+        .bind(&content_id)
+        .bind(content)
+        .execute(pool)
+        .await?;
+    }
+
+    let (status, response) = fixture
+        .search_with_body(json!({
+            "query": "facetglobal",
+            "mode": "fulltext",
+            "source_types": ["local_files"],
+            "limit": 10
+        }))
+        .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let results = response["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "source filter should limit hits to local_files"
+    );
+    assert_eq!(results[0]["source_type"].as_str(), Some("local_files"));
+
+    let source_facet = response["facets"]
+        .as_array()
+        .expect("Expected unfiltered facets")
+        .iter()
+        .find(|facet| facet["name"].as_str() == Some("source_type"))
+        .expect("Expected source_type facet");
+    let facet_values: Vec<&str> = source_facet["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value["value"].as_str())
+        .collect();
+    assert!(
+        facet_values.contains(&"local_files") && facet_values.contains(&"google_drive"),
+        "source_type facets should remain unfiltered by active source filter: {:?}",
+        facet_values
+    );
 
     Ok(())
 }
@@ -1035,6 +1494,52 @@ async fn test_special_characters_in_queries() -> Result<()> {
 // ============================================================================
 // Group Permission Tests
 // ============================================================================
+
+async fn insert_public_document_with_embedding(
+    pool: &sqlx::PgPool,
+    source_id: &str,
+    external_id: &str,
+    title: &str,
+    content: &str,
+    embedding_text: &str,
+    updated_at: &str,
+) -> Result<String> {
+    let doc_id = Ulid::new().to_string();
+    let content_storage = shared::ContentStorage::new(pool.clone());
+    let content_id = content_storage.store_text(content.to_string()).await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, content, metadata, permissions, attributes, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, 'document', $6, jsonb_build_object('updated_at', $7::text), '{"public": true, "users": [], "groups": []}', '{}', $7::timestamptz, $7::timestamptz)
+        "#,
+    )
+    .bind(&doc_id)
+    .bind(source_id)
+    .bind(external_id)
+    .bind(title)
+    .bind(&content_id)
+    .bind(content)
+    .bind(updated_at)
+    .execute(pool)
+    .await?;
+
+    let embedding = shared::test_environment::generate_test_embedding(embedding_text);
+    sqlx::query(
+        r#"
+        INSERT INTO embeddings (id, document_id, chunk_index, chunk_start_offset, chunk_end_offset, embedding, model_name, dimensions, created_at)
+        VALUES ($1, $2, 0, 0, $3, $4, 'test-model', 1024, NOW())
+        "#,
+    )
+    .bind(Ulid::new().to_string())
+    .bind(&doc_id)
+    .bind(content.len() as i32)
+    .bind(&embedding)
+    .execute(pool)
+    .await?;
+
+    Ok(doc_id)
+}
 
 const TEST_SOURCE_ID: &str = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
 

@@ -1,5 +1,5 @@
 use crate::models::{
-    AlsoIn, RecentSearchesResponse, SearchMode, SearchRequest, SearchResponse, SearchResult,
+    RecentSearchesResponse, SearchMode, SearchRequest, SearchResponse, SearchResult,
 };
 use crate::operator_registry::OperatorRegistry;
 use crate::query_parser;
@@ -19,7 +19,6 @@ use shared::{
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -238,7 +237,6 @@ impl SearchEngine {
 
         let repo = DocumentRepository::new(self.db_pool.pool());
         let search_repo = SearchDocumentRepository::new(self.db_pool.pool());
-        let limit = request.limit();
 
         // Empty query is allowed ONLY if some narrowing filter will scope the
         // result set. Otherwise `filter_only_search` would scan the entire
@@ -273,15 +271,34 @@ impl SearchEngine {
             all_source_ids.clone()
         };
 
+        let tantivy_query = search_repo.build_query_text(&request.query).await?;
+
         let search_future = async {
             let start_ts = Instant::now();
             let res = match request.search_mode() {
                 SearchMode::Fulltext => {
-                    self.fulltext_search(&search_repo, &request, &filtered_source_ids, &user_groups)
+                    self.fulltext_search(
+                        &search_repo,
+                        &request,
+                        &filtered_source_ids,
+                        &user_groups,
+                        tantivy_query.as_deref(),
+                        request.limit(),
+                        request.offset(),
+                    )
+                    .await
+                }
+                SearchMode::Semantic => {
+                    let results = self
+                        .semantic_search(&request, &user_groups, request.limit(), request.offset())
+                        .await?;
+                    let total_count = results.len() as i64;
+                    Ok((results, total_count))
+                }
+                SearchMode::Hybrid => {
+                    self.hybrid_search(&request, &user_groups, tantivy_query.as_deref())
                         .await
                 }
-                SearchMode::Semantic => self.semantic_search(&request).await,
-                SearchMode::Hybrid => self.hybrid_search(&request, &user_groups).await,
             };
 
             debug!("Search future completed in: {:?}", start_ts.elapsed());
@@ -295,6 +312,7 @@ impl SearchEngine {
                 let facets = search_repo
                     .get_facet_counts(
                         &request.query,
+                        tantivy_query.as_deref(),
                         &all_source_ids,
                         None,
                         None,
@@ -316,40 +334,8 @@ impl SearchEngine {
             }
         };
 
-        // Filtered facets: used only for total_count (pagination)
-        let filtered_facets_future = async {
-            if request.include_facets() {
-                let start_ts = Instant::now();
-                let facets = search_repo
-                    .get_facet_counts(
-                        &request.query,
-                        &filtered_source_ids,
-                        request.content_types.as_deref(),
-                        request.attribute_filters.as_ref(),
-                        request.user_email().map(|e| e.as_str()),
-                        &user_groups,
-                        request.date_filter.as_ref(),
-                        request.person_filters.as_deref(),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        info!("Failed to get filtered facet counts: {}", e);
-                        vec![]
-                    });
-
-                debug!("Filtered facets fetched in {:?}", start_ts.elapsed());
-                facets
-            } else {
-                vec![]
-            }
-        };
-
-        let (search_result, facets, filtered_facets) = tokio::join!(
-            search_future,
-            unfiltered_facets_future,
-            filtered_facets_future
-        );
-        let mut results = search_result?;
+        let (search_result, facets) = tokio::join!(search_future, unfiltered_facets_future);
+        let (mut results, total_count) = search_result?;
 
         // Apply source boost for implicit source words (e.g. "standup slack")
         if !parsed.boosted_source_types.is_empty() {
@@ -396,30 +382,17 @@ impl SearchEngine {
             results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         }
 
-        // Deduplicate cross-source results sharing the same external_id.
-        // IMAP email threads from different accounts but the same mailing list
-        // produce identical external_ids (source_id is not part of the ID).
-        // Keep the highest-scoring result per group; apply offset+limit after
-        // dedup so duplicates are consistent across pages.
-        let (mut results, dedup_removed) = Self::deduplicate_cross_source(
-            results,
-            request.offset() as usize,
-            request.limit() as usize,
-        );
-
         self.populate_fulltext_highlights(&search_repo, &request.query, &mut results)
             .await?;
 
-        let total_count: i64 = filtered_facets
-            .iter()
-            .flat_map(|f| f.values.iter().filter_map(|fv| fv.count))
-            .sum::<i64>()
-            .saturating_sub(dedup_removed as i64)
-            .max(0);
-        let has_more = total_count >= limit;
+        let has_more = request.offset() + request.limit() < total_count;
         let query_time = start_time.elapsed().as_millis() as u64;
 
-        self.populate_source_types(&mut results).await?;
+        if !matches!(request.search_mode(), SearchMode::Fulltext)
+            && results.iter().any(|result| result.source_type.is_none())
+        {
+            self.populate_source_types(&mut results).await?;
+        }
 
         // Build active_filters from merged request state
         let active_filters = build_active_filters(&request);
@@ -491,13 +464,22 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// Run fulltext search for a specific fetch window.
+    ///
+    /// `fetch_limit`/`fetch_offset` are intentionally separate from
+    /// `SearchRequest::limit`/`offset`: direct fulltext search uses the request
+    /// window, while hybrid search fetches from offset 0 with enough candidates
+    /// to apply RRF before final pagination.
     async fn fulltext_search(
         &self,
         repo: &SearchDocumentRepository,
         request: &SearchRequest,
         source_ids: &[String],
         user_groups: &[String],
-    ) -> Result<Vec<SearchResult>> {
+        tantivy_query: Option<&str>,
+        fetch_limit: i64,
+        fetch_offset: i64,
+    ) -> Result<(Vec<SearchResult>, i64)> {
         let start_time = Instant::now();
         let content_types = request.content_types.as_deref();
         let attribute_filters = request.attribute_filters.as_ref();
@@ -506,11 +488,12 @@ impl SearchEngine {
         let search_hits = repo
             .search(
                 &request.query,
+                tantivy_query,
                 source_ids,
                 content_types,
                 attribute_filters,
-                request.dedup_fetch_limit(),
-                0,
+                fetch_limit,
+                fetch_offset,
                 request.user_email().map(|e| e.as_str()),
                 user_groups,
                 request.document_id.as_deref(),
@@ -520,6 +503,7 @@ impl SearchEngine {
                 self.config.recency_half_life_days,
             )
             .await?;
+        let (search_hits, total_count) = search_hits;
 
         let mut results = Vec::new();
 
@@ -544,33 +528,31 @@ impl SearchEngine {
                 highlights,
                 match_type: "fulltext".to_string(),
                 content: None,
-                source_type: None,
+                source_type: search_hit.source_type,
                 also_in: Vec::new(),
             });
-        }
-
-        const MIN_SCORE_RATIO: f32 = 0.15;
-        if let Some(max_score) = results.first().map(|r| r.score) {
-            if max_score > 0.0 {
-                let threshold = max_score * MIN_SCORE_RATIO;
-                results.retain(|r| r.score >= threshold);
-            }
         }
 
         info!(
             "Fulltext search completed in {}ms",
             start_time.elapsed().as_millis()
         );
-        Ok(results)
+        Ok((results, total_count))
     }
 
-    async fn semantic_search(&self, request: &SearchRequest) -> Result<Vec<SearchResult>> {
+    async fn semantic_search(
+        &self,
+        request: &SearchRequest,
+        user_groups: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SearchResult>> {
         let start_time = Instant::now();
         info!("Performing semantic search for query: '{}'", request.query);
 
         let query_embedding = self.generate_query_embedding(&request.query).await?;
 
-        let embedding_repo = EmbeddingRepository::new(self.db_pool.pool());
+        let search_repo = SearchDocumentRepository::new(self.db_pool.pool());
         let doc_repo = DocumentRepository::new(self.db_pool.pool());
 
         let sources = request.source_types.as_deref();
@@ -579,14 +561,15 @@ impl SearchEngine {
         // Recency boost is applied in SQL (inside find_similar_with_filters)
         // by over-fetching candidates and re-ranking with an exponential decay
         // factor, consistent with how FTS handles recency in search_repository.
-        let chunk_results = embedding_repo
+        let chunk_results = search_repo
             .find_similar_with_filters(
                 query_embedding,
                 sources,
                 content_types,
-                request.dedup_fetch_limit(),
-                0,
+                limit,
+                offset,
                 request.user_email().map(|e| e.as_str()),
+                user_groups,
                 request.document_id.as_deref(),
                 self.config.recency_boost_weight,
                 self.config.recency_half_life_days,
@@ -858,7 +841,12 @@ impl SearchEngine {
         let results = if !request.query.trim().is_empty() {
             // Query provided: do hybrid search within document
             info!("Query provided, hybrid search within document");
-            self.hybrid_search(request, &user_groups).await?
+            let search_repo = SearchDocumentRepository::new(self.db_pool.pool());
+            let tantivy_query = search_repo.build_query_text(&request.query).await?;
+            let (results, _total_count) = self
+                .hybrid_search(request, &user_groups, tantivy_query.as_deref())
+                .await?;
+            results
         } else {
             info!(
                 "No query provided, returning first 500 lines from document ID {}",
@@ -927,6 +915,7 @@ impl SearchEngine {
     async fn get_enhanced_semantic_results_for_rag(
         &self,
         request: &SearchRequest,
+        user_groups: &[String],
     ) -> Result<Vec<SearchResult>> {
         let start_time = Instant::now();
         info!(
@@ -935,6 +924,7 @@ impl SearchEngine {
         );
 
         let query_embedding = self.generate_query_embedding(&request.query).await?;
+        let search_repo = SearchDocumentRepository::new(self.db_pool.pool());
         let embedding_repo = EmbeddingRepository::new(self.db_pool.pool());
         let doc_repo = DocumentRepository::new(self.db_pool.pool());
 
@@ -942,7 +932,7 @@ impl SearchEngine {
         let content_types = request.content_types.as_deref();
 
         // Recency boost is applied in SQL (see find_similar_with_filters).
-        let chunk_results = embedding_repo
+        let chunk_results = search_repo
             .find_similar_with_filters(
                 query_embedding,
                 sources,
@@ -950,6 +940,7 @@ impl SearchEngine {
                 request.limit(),
                 request.offset(),
                 request.user_email().map(|e| e.as_str()),
+                user_groups,
                 None,
                 self.config.recency_boost_weight,
                 self.config.recency_half_life_days,
@@ -1047,7 +1038,8 @@ impl SearchEngine {
         &self,
         request: &SearchRequest,
         user_groups: &[String],
-    ) -> Result<Vec<SearchResult>> {
+        tantivy_query: Option<&str>,
+    ) -> Result<(Vec<SearchResult>, i64)> {
         info!("Performing hybrid search for query: '{}'", request.query);
         let start_time = Instant::now();
 
@@ -1056,16 +1048,25 @@ impl SearchEngine {
         let source_ids = doc_repo
             .fetch_active_source_ids(request.source_types.as_deref())
             .await?;
-        let fts_future = self.fulltext_search(&search_repo, request, &source_ids, user_groups);
+        let candidate_limit = request.offset() + request.limit();
+        let fts_future = self.fulltext_search(
+            &search_repo,
+            request,
+            &source_ids,
+            user_groups,
+            tantivy_query,
+            candidate_limit,
+            0,
+        );
 
         // Apply timeout to semantic search
         let semantic_future = tokio::time::timeout(
             Duration::from_millis(self.config.semantic_search_timeout_ms),
-            self.semantic_search(request),
+            self.semantic_search(request, user_groups, candidate_limit, 0),
         );
 
         let (fts_results, semantic_results) = tokio::join!(fts_future, semantic_future);
-        let fts_results = fts_results?;
+        let (fts_results, fts_total_count) = fts_results?;
 
         // Handle semantic search timeout gracefully
         let semantic_results = match semantic_results {
@@ -1113,7 +1114,7 @@ impl SearchEngine {
                     highlights: result.highlights,
                     match_type: "fulltext".to_string(),
                     content: result.content,
-                    source_type: None,
+                    source_type: result.source_type,
                     also_in: Vec::new(),
                 },
             );
@@ -1158,118 +1159,38 @@ impl SearchEngine {
             })
             .collect();
         final_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        self.populate_source_types(&mut final_results).await?;
+        final_results = Self::deduplicate_ranked_results_by_external_id(final_results);
 
-        if final_results.len() > request.dedup_fetch_limit() as usize {
-            final_results.truncate(request.dedup_fetch_limit() as usize);
-        }
+        final_results = final_results
+            .into_iter()
+            .skip(request.offset() as usize)
+            .take(request.limit() as usize)
+            .collect();
 
         info!(
             "Hybrid search completed in {}ms",
             start_time.elapsed().as_millis()
         );
-        Ok(final_results)
+        Ok((final_results, fts_total_count))
     }
 
-    /// Deduplicate search results that share the same `external_id`.
-    ///
-    /// IMAP email threads from different accounts but the same mailing list
-    /// produce identical `external_id` values (source_id is not baked in).
-    /// Only results whose `external_id` starts with a known dedup-eligible
-    /// prefix participate; all others pass through unchanged.
-    ///
-    /// The highest-scoring result per group is kept (tiebreaker: `updated_at`).
-    /// Collapsed duplicates are recorded in `also_in` on the winner.
-    /// Permissions are NOT mutated — the SQL layer already filters by the
-    /// requesting user's access.
-    ///
-    /// Pagination (`offset` / `limit`) is applied **after** dedup so that
-    /// cross-page results are consistent (no duplicates across pages).
-    fn deduplicate_cross_source(
-        results: Vec<SearchResult>,
-        offset: usize,
-        limit: usize,
-    ) -> (Vec<SearchResult>, usize) {
-        // Group indices by external_id for dedup-eligible results only.
-        let mut dedup_groups: HashMap<String, Vec<usize>> = HashMap::new();
-        for (idx, result) in results.iter().enumerate() {
-            if result.document.external_id.starts_with("imap-thread:") {
-                dedup_groups
-                    .entry(result.document.external_id.clone())
-                    .or_default()
-                    .push(idx);
-            }
-        }
-
-        // Fast path: nothing to deduplicate
-        if dedup_groups.values().all(|indices| indices.len() <= 1) {
-            let mut results = results;
-            let end = results.len().min(offset + limit);
-            let start = offset.min(end);
-            return (results.drain(start..end).collect(), 0);
-        }
-
-        // Map from best_idx -> list of AlsoIn entries for its collapsed duplicates
-        let mut also_in_map: HashMap<usize, Vec<AlsoIn>> = HashMap::new();
-        let mut remove_indices: HashSet<usize> = HashSet::new();
-
-        for indices in dedup_groups.values() {
-            if indices.len() <= 1 {
-                continue;
-            }
-
-            // Find the best result: highest score, then most recently updated
-            let best_idx = *indices
-                .iter()
-                .max_by(|&&a, &&b| {
-                    let score_cmp = results[a]
-                        .score
-                        .partial_cmp(&results[b].score)
-                        .unwrap_or(Ordering::Equal);
-                    if score_cmp != Ordering::Equal {
-                        return score_cmp;
-                    }
-                    results[a]
-                        .document
-                        .updated_at
-                        .cmp(&results[b].document.updated_at)
-                })
-                .expect("indices is non-empty");
-
-            let entries = also_in_map.entry(best_idx).or_default();
-            for &idx in indices {
-                if idx != best_idx {
-                    entries.push(AlsoIn {
-                        source_id: results[idx].document.source_id.clone(),
-                        document_id: results[idx].document.id.clone(),
-                        score: results[idx].score,
-                    });
-                    remove_indices.insert(idx);
-                }
-            }
-        }
-
-        let deduped: Vec<SearchResult> = results
+    /// Collapse an already-ranked result list by the same generic dedupe key
+    /// used by SQL search: `(source_type, external_id)`. Hybrid search needs
+    /// this final pass because FTS and semantic search dedupe independently and
+    /// can choose different physical rows for the same logical document.
+    fn deduplicate_ranked_results_by_external_id(results: Vec<SearchResult>) -> Vec<SearchResult> {
+        let mut seen = std::collections::HashSet::new();
+        results
             .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !remove_indices.contains(idx))
-            .map(|(idx, mut result)| {
-                if let Some(entries) = also_in_map.remove(&idx) {
-                    result.also_in = entries;
-                }
-                result
+            .filter(|result| {
+                let source_type = result
+                    .source_type
+                    .as_ref()
+                    .expect("source_type is populated before hybrid dedupe");
+                seen.insert((source_type.clone(), result.document.external_id.clone()))
             })
-            .skip(offset)
-            .take(limit)
-            .collect();
-
-        debug!(
-            "Cross-source dedup removed {} duplicates, returning {} results (offset={})",
-            remove_indices.len(),
-            deduped.len(),
-            offset,
-        );
-
-        (deduped, remove_indices.len())
+            .collect()
     }
 
     fn generate_cache_key(&self, request: &SearchRequest) -> String {
@@ -1400,12 +1321,23 @@ impl SearchEngine {
         let source_ids = doc_repo
             .fetch_active_source_ids(request.source_types.as_deref())
             .await?;
-        let fts_results = self
-            .fulltext_search(&search_repo, request, &source_ids, &user_groups)
+        let tantivy_query = search_repo.build_query_text(&request.query).await?;
+        let (fts_results, _fts_total_count) = self
+            .fulltext_search(
+                &search_repo,
+                request,
+                &source_ids,
+                &user_groups,
+                tantivy_query.as_deref(),
+                request.limit(),
+                request.offset(),
+            )
             .await?;
 
         // Get semantic search results enhanced with expanded context for RAG
-        let semantic_results = self.get_enhanced_semantic_results_for_rag(request).await?;
+        let semantic_results = self
+            .get_enhanced_semantic_results_for_rag(request, &user_groups)
+            .await?;
 
         // Combine semantic and fulltext context
         let mut combined_results = Vec::new();

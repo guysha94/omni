@@ -1,10 +1,12 @@
+use pgvector::Vector;
 use serde_json::Value as JsonValue;
 use shared::{
     db::error::DatabaseError,
     db::repositories::document,
-    models::{AttributeFilter, DateFilter, Document, Facet, FacetValue},
+    models::{AttributeFilter, ChunkResult, DateFilter, Document, Facet, FacetValue},
+    SourceType,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{postgres::PgRow, FromRow, PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -16,6 +18,11 @@ const CANDIDATE_PADDING: i64 = 200;
 /// the Tantivy index scan, avoiding full result-set materialisation.
 const FACET_CANDIDATE_LIMIT: i64 = 10_000;
 
+/// Drop weak fulltext matches relative to the strongest recency-adjusted score.
+/// Keep this in SQL so `total_count` and pagination use the same row universe
+/// as displayed fulltext hits.
+const MIN_SCORE_RATIO: f32 = 0.15;
+
 #[derive(FromRow)]
 pub struct SearchHit {
     #[sqlx(flatten)]
@@ -23,6 +30,33 @@ pub struct SearchHit {
     pub score: f32,
     #[sqlx(default)]
     pub content_snippets: Option<Vec<String>>,
+    #[sqlx(default)]
+    pub source_type: Option<String>,
+}
+
+struct SearchHitWithTotalRow {
+    hit: Option<SearchHit>,
+    total_count: i64,
+}
+
+impl<'r> FromRow<'r, PgRow> for SearchHitWithTotalRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let total_count = row.try_get("total_count")?;
+        let id: Option<String> = row.try_get("id")?;
+        let hit = if id.is_some() {
+            Some(SearchHit::from_row(row)?)
+        } else {
+            None
+        };
+
+        Ok(Self { hit, total_count })
+    }
+}
+
+impl SearchHitWithTotalRow {
+    fn into_search_hit(self) -> Option<SearchHit> {
+        self.hit
+    }
 }
 
 pub struct SearchDocumentRepository {
@@ -34,40 +68,9 @@ impl SearchDocumentRepository {
         Self { pool: pool.clone() }
     }
 
-    pub async fn search(
-        &self,
-        query: &str,
-        source_ids: &[String],
-        content_types: Option<&[String]>,
-        attribute_filters: Option<&HashMap<String, AttributeFilter>>,
-        limit: i64,
-        offset: i64,
-        user_email: Option<&str>,
-        user_groups: &[String],
-        document_id: Option<&str>,
-        date_filter: Option<&DateFilter>,
-        person_filters: Option<&[String]>,
-        recency_boost_weight: f32,
-        recency_half_life_days: f32,
-    ) -> Result<Vec<SearchHit>, DatabaseError> {
-        if source_ids.is_empty() {
-            return Ok(vec![]);
-        }
-
+    pub async fn build_query_text(&self, query: &str) -> Result<Option<String>, DatabaseError> {
         if query.trim().is_empty() {
-            return self
-                .filter_only_search(
-                    source_ids,
-                    content_types,
-                    attribute_filters,
-                    limit,
-                    offset,
-                    user_email,
-                    user_groups,
-                    date_filter,
-                    person_filters,
-                )
-                .await;
+            return Ok(None);
         }
 
         // Tokenize query via ParadeDB: splits on non-alphanumeric, ASCII-folds.
@@ -89,7 +92,53 @@ impl SearchDocumentRepository {
             .take(12)
             .collect();
 
-        let tantivy_query = build_tantivy_query(&terms, query);
+        Ok(Some(build_tantivy_query(&terms, query)))
+    }
+
+    pub async fn search(
+        &self,
+        query: &str,
+        tantivy_query: Option<&str>,
+        source_ids: &[String],
+        content_types: Option<&[String]>,
+        attribute_filters: Option<&HashMap<String, AttributeFilter>>,
+        limit: i64,
+        offset: i64,
+        user_email: Option<&str>,
+        user_groups: &[String],
+        document_id: Option<&str>,
+        date_filter: Option<&DateFilter>,
+        person_filters: Option<&[String]>,
+        recency_boost_weight: f32,
+        recency_half_life_days: f32,
+    ) -> Result<(Vec<SearchHit>, i64), DatabaseError> {
+        if source_ids.is_empty() {
+            return Ok((vec![], 0));
+        }
+
+        if query.trim().is_empty() {
+            return self
+                .filter_only_search(
+                    source_ids,
+                    content_types,
+                    attribute_filters,
+                    limit,
+                    offset,
+                    user_email,
+                    user_groups,
+                    date_filter,
+                    person_filters,
+                )
+                .await;
+        }
+
+        let owned_tantivy_query;
+        let tantivy_query = if let Some(tq) = tantivy_query {
+            tq
+        } else {
+            owned_tantivy_query = self.build_query_text(query).await?.unwrap_or_default();
+            &owned_tantivy_query
+        };
 
         // Bind params: $1 = tantivy query string, then filters
         let mut param_idx = 2;
@@ -107,7 +156,7 @@ impl SearchDocumentRepository {
         );
 
         if document_id.is_some() {
-            filters.push(format!("id = ${}", param_idx));
+            filters.push(format!("d.id = ${}", param_idx));
             param_idx += 1;
         }
 
@@ -117,7 +166,7 @@ impl SearchDocumentRepository {
                 .iter()
                 .map(|p| {
                     let escaped = p.replace('\'', "''");
-                    format!("metadata ||| 'author:{escaped}'")
+                    format!("d.metadata ||| 'author:{escaped}'")
                 })
                 .collect();
             if !conditions.is_empty() {
@@ -138,6 +187,7 @@ impl SearchDocumentRepository {
         let offset_idx = param_idx + 2;
         let weight_idx = param_idx + 3;
         let half_life_idx = param_idx + 4;
+        let min_score_ratio_idx = param_idx + 5;
 
         let recency_expr = format!(
             "(1.0 + ${w}::double precision * EXP(-EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(\
@@ -151,37 +201,92 @@ impl SearchDocumentRepository {
 
         let full_query = format!(
             r#"
-            WITH candidates AS (
-                SELECT id, pdb.score(id) as bm25_score
-                FROM documents
-                WHERE id @@@ pdb.parse($1, lenient => true){filter_where}
+            WITH filtered_candidates AS MATERIALIZED (
+                SELECT d.id, d.source_id, pdb.score(d.id) as bm25_score
+                FROM documents d
+                JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+                WHERE d.id @@@ pdb.parse($1, lenient => true){filter_where}
                 ORDER BY bm25_score DESC
                 LIMIT ${candidate_limit_idx}
             ),
+            scored_candidates AS (
+                SELECT fc.id, (fc.bm25_score * {recency_expr}) as score
+                FROM filtered_candidates fc
+                JOIN documents d ON d.id = fc.id
+            ),
+            max_score AS (
+                SELECT MAX(score) AS value FROM scored_candidates
+            ),
+            relevant_candidates AS MATERIALIZED (
+                SELECT sc.id, sc.score
+                FROM scored_candidates sc
+                CROSS JOIN max_score ms
+                WHERE ms.value <= 0 OR sc.score >= (ms.value * ${min_score_ratio_idx}::real)
+            ),
+            -- Dedupe by (source_type, external_id), not source_id. Connectors may emit
+            -- the same logical document from multiple sources of the same type (for
+            -- example two IMAP accounts seeing the same thread), but external_id is
+            -- only considered canonical within a connector/source-type namespace.
+            deduped_candidates AS MATERIALIZED (
+                SELECT id, score
+                FROM (
+                    SELECT rc.id, rc.score,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.source_type, d.external_id
+                               ORDER BY rc.score DESC,
+                                        COALESCE(
+                                            CASE WHEN d.metadata->>'updated_at' IS NOT NULL
+                                                 AND pg_input_is_valid(d.metadata->>'updated_at', 'timestamptz')
+                                            THEN (d.metadata->>'updated_at')::timestamptz END,
+                                            d.updated_at) DESC,
+                                        d.id
+                           ) AS dedupe_rank
+                    FROM relevant_candidates rc
+                    JOIN documents d ON d.id = rc.id
+                    JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+                ) ranked_candidates
+                WHERE dedupe_rank = 1
+            ),
+            total AS (
+                SELECT COUNT(*)::bigint AS total_count FROM deduped_candidates
+            ),
             ranked AS (
-                SELECT c.id, (c.bm25_score * {recency_expr}) as score
-                FROM candidates c
-                JOIN documents d ON d.id = c.id
+                SELECT dc.id, dc.score
+                FROM deduped_candidates dc
                 ORDER BY score DESC
                 LIMIT ${limit_idx} OFFSET ${offset_idx}
+            ),
+            hits AS (
+                SELECT r.id, r.score,
+                       d.source_id, d.external_id, d.title, d.content_id, d.content_type,
+                       d.file_size, d.file_extension, d.url,
+                       d.metadata, d.permissions, d.attributes, d.created_at, d.updated_at, d.last_indexed_at,
+                       NULL::text[] as content_snippets,
+                       s.source_type::text as source_type
+                FROM ranked r
+                JOIN documents d ON d.id = r.id
+                JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
             )
-            SELECT r.id, r.score,
-                   d.source_id, d.external_id, d.title, d.content_id, d.content_type,
-                   d.file_size, d.file_extension, d.url,
-                   d.metadata, d.permissions, d.attributes, d.created_at, d.updated_at, d.last_indexed_at,
-                   NULL::text[] as content_snippets
-            FROM ranked r
-            JOIN documents d ON d.id = r.id
-            ORDER BY r.score DESC"#,
+            SELECT h.id, h.score,
+                   h.source_id, h.external_id, h.title, h.content_id, h.content_type,
+                   h.file_size, h.file_extension, h.url,
+                   h.metadata, h.permissions, h.attributes, h.created_at, h.updated_at, h.last_indexed_at,
+                   h.content_snippets, h.source_type,
+                   t.total_count
+            FROM total t
+            LEFT JOIN hits h ON TRUE
+            ORDER BY h.score DESC NULLS LAST"#,
             filter_where = filter_where,
             recency_expr = recency_expr,
             candidate_limit_idx = candidate_limit_idx,
             limit_idx = limit_idx,
             offset_idx = offset_idx,
+            min_score_ratio_idx = min_score_ratio_idx,
         );
         debug!("Full search query: {}", full_query);
 
-        let mut query_builder = sqlx::query_as::<_, SearchHit>(&full_query).bind(&tantivy_query);
+        let mut query_builder =
+            sqlx::query_as::<_, SearchHitWithTotalRow>(&full_query).bind(tantivy_query);
 
         query_builder = query_builder.bind(source_ids);
 
@@ -195,17 +300,23 @@ impl SearchDocumentRepository {
             query_builder = query_builder.bind(doc_id);
         }
 
-        let candidate_limit = offset + limit + CANDIDATE_PADDING;
+        let candidate_limit = FACET_CANDIDATE_LIMIT.max(offset + limit + CANDIDATE_PADDING);
         query_builder = query_builder
             .bind(candidate_limit)
             .bind(limit)
             .bind(offset)
             .bind(recency_boost_weight as f64)
-            .bind(recency_half_life_days as f64);
+            .bind(recency_half_life_days as f64)
+            .bind(MIN_SCORE_RATIO);
 
-        let results = query_builder.fetch_all(&self.pool).await?;
+        let rows = query_builder.fetch_all(&self.pool).await?;
+        let total_count = rows.first().map_or(0, |row| row.total_count);
+        let results = rows
+            .into_iter()
+            .filter_map(SearchHitWithTotalRow::into_search_hit)
+            .collect();
 
-        Ok(results)
+        Ok((results, total_count))
     }
 
     async fn filter_only_search(
@@ -219,7 +330,7 @@ impl SearchDocumentRepository {
         user_groups: &[String],
         date_filter: Option<&DateFilter>,
         person_filters: Option<&[String]>,
-    ) -> Result<Vec<SearchHit>, DatabaseError> {
+    ) -> Result<(Vec<SearchHit>, i64), DatabaseError> {
         let mut param_idx = 1;
         let mut filters = Vec::new();
         build_common_filters(
@@ -246,7 +357,7 @@ impl SearchDocumentRepository {
                 .iter()
                 .map(|p| {
                     let escaped = p.replace('\'', "''");
-                    format!("metadata->>'author' ILIKE '%{escaped}%'")
+                    format!("d.metadata->>'author' ILIKE '%{escaped}%'")
                 })
                 .collect();
             if !conditions.is_empty() {
@@ -254,7 +365,7 @@ impl SearchDocumentRepository {
             }
         }
 
-        let where_clause = if filters.is_empty() {
+        let filter_where = if filters.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", filters.join(" AND "))
@@ -262,25 +373,74 @@ impl SearchDocumentRepository {
 
         let query_str = format!(
             r#"
-            SELECT id, 0.0::real as score, source_id, external_id, title, content_id, content_type,
-                   file_size, file_extension, url,
-                   metadata, permissions, attributes, created_at, updated_at, last_indexed_at,
-                   ARRAY[LEFT(content, 240)] as content_snippets
-            FROM documents
-            {where_clause}
-            ORDER BY COALESCE(
-                CASE WHEN metadata->>'updated_at' IS NOT NULL
-                     AND pg_input_is_valid(metadata->>'updated_at', 'timestamptz')
-                THEN (metadata->>'updated_at')::timestamptz END,
-                updated_at) DESC
-            LIMIT ${limit_idx} OFFSET ${offset_idx}
+            WITH filtered_scope AS MATERIALIZED (
+                SELECT d.id, d.source_id
+                FROM documents d
+                JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+                {filter_where}
+            ),
+            -- Dedupe by (source_type, external_id), not source_id. Connectors may emit
+            -- the same logical document from multiple sources of the same type, but
+            -- external_id is only considered canonical within a connector/source-type
+            -- namespace, so different source types with matching IDs remain distinct.
+            deduped_scope AS MATERIALIZED (
+                SELECT id
+                FROM (
+                    SELECT fs.id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s.source_type, d.external_id
+                               ORDER BY COALESCE(
+                                            CASE WHEN d.metadata->>'updated_at' IS NOT NULL
+                                                 AND pg_input_is_valid(d.metadata->>'updated_at', 'timestamptz')
+                                            THEN (d.metadata->>'updated_at')::timestamptz END,
+                                            d.updated_at) DESC,
+                                        d.id
+                           ) AS dedupe_rank
+                    FROM filtered_scope fs
+                    JOIN documents d ON d.id = fs.id
+                    JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+                ) ranked_scope
+                WHERE dedupe_rank = 1
+            ),
+            total AS (
+                SELECT COUNT(*)::bigint AS total_count FROM deduped_scope
+            ),
+            ranked AS (
+                SELECT ds.id
+                FROM deduped_scope ds
+                JOIN documents d ON d.id = ds.id
+                ORDER BY COALESCE(
+                    CASE WHEN d.metadata->>'updated_at' IS NOT NULL
+                         AND pg_input_is_valid(d.metadata->>'updated_at', 'timestamptz')
+                    THEN (d.metadata->>'updated_at')::timestamptz END,
+                    d.updated_at) DESC
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
+            ),
+            hits AS (
+                SELECT d.id, 0.0::real as score, d.source_id, d.external_id, d.title, d.content_id, d.content_type,
+                       d.file_size, d.file_extension, d.url,
+                       d.metadata, d.permissions, d.attributes, d.created_at, d.updated_at, d.last_indexed_at,
+                       ARRAY[LEFT(d.content, 240)] as content_snippets,
+                       s.source_type::text as source_type
+                FROM ranked r
+                JOIN documents d ON d.id = r.id
+                JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+            )
+            SELECT h.id, h.score, h.source_id, h.external_id, h.title, h.content_id, h.content_type,
+                   h.file_size, h.file_extension, h.url,
+                   h.metadata, h.permissions, h.attributes, h.created_at, h.updated_at, h.last_indexed_at,
+                   h.content_snippets, h.source_type,
+                   t.total_count
+            FROM total t
+            LEFT JOIN hits h ON TRUE
+            ORDER BY h.updated_at DESC NULLS LAST
             "#,
-            where_clause = where_clause,
+            filter_where = filter_where,
             limit_idx = param_idx,
             offset_idx = param_idx + 1,
         );
 
-        let mut query_builder = sqlx::query_as::<_, SearchHit>(&query_str);
+        let mut query_builder = sqlx::query_as::<_, SearchHitWithTotalRow>(&query_str);
 
         query_builder = query_builder.bind(source_ids);
 
@@ -292,8 +452,13 @@ impl SearchDocumentRepository {
 
         query_builder = query_builder.bind(limit).bind(offset);
 
-        let results = query_builder.fetch_all(&self.pool).await?;
-        Ok(results)
+        let rows = query_builder.fetch_all(&self.pool).await?;
+        let total_count = rows.first().map_or(0, |row| row.total_count);
+        let results = rows
+            .into_iter()
+            .filter_map(SearchHitWithTotalRow::into_search_hit)
+            .collect();
+        Ok((results, total_count))
     }
 
     pub async fn fetch_highlights(
@@ -337,9 +502,183 @@ impl SearchDocumentRepository {
             .collect())
     }
 
+    pub async fn find_similar_with_filters(
+        &self,
+        embedding: Vec<f32>,
+        source_types: Option<&[SourceType]>,
+        content_types: Option<&[String]>,
+        limit: i64,
+        offset: i64,
+        user_email: Option<&str>,
+        user_groups: &[String],
+        document_id: Option<&str>,
+        recency_boost_weight: f32,
+        recency_half_life_days: f32,
+    ) -> Result<Vec<ChunkResult>, DatabaseError> {
+        let dims = embedding.len() as i16;
+        let vector = Vector::from(embedding);
+
+        let mut where_conditions = Vec::new();
+
+        // Filter to matching dimensions so the partial HNSW index is used
+        where_conditions.push(format!("e.dimensions = ${}", 4));
+
+        // Fixed bind slots: $1=vector, $2=limit, $3=offset, $4=dims,
+        // $5=recency_boost_weight, $6=recency_half_life_days.
+        // Dynamic filters (document_id, source_types, content_types) start at $7.
+        let mut bind_index = 7;
+
+        // Filter by the current active embedding model via subquery
+        where_conditions.push(
+            "e.model_name = (SELECT config->>'model' FROM embedding_providers WHERE is_current = TRUE AND is_deleted = FALSE LIMIT 1)"
+                .to_string(),
+        );
+
+        if document_id.is_some() {
+            where_conditions.push(format!("e.document_id = ${}", bind_index));
+            bind_index += 1;
+        }
+
+        if let Some(src) = source_types {
+            if !src.is_empty() {
+                where_conditions.push(format!(
+                    "d.source_id IN (SELECT id FROM sources WHERE source_type = ANY(${}))",
+                    bind_index
+                ));
+                bind_index += 1;
+            }
+        }
+
+        if let Some(ct) = content_types {
+            if !ct.is_empty() {
+                where_conditions.push(format!("d.content_type = ANY(${})", bind_index));
+            }
+        }
+
+        if let Some(email) = user_email {
+            where_conditions.push(generate_permission_filter(email, user_groups));
+        }
+
+        let where_clause = format!("WHERE {}", where_conditions.join(" AND "));
+
+        // Recency-boosted vector search (mirrors the FTS approach).
+        // First materialize top vector candidates, then rerank by recency and
+        // dedupe by the same `(source_type, external_id)` key used for FTS.
+        let recency_expr = format!(
+            "(1.0 + $5::double precision * EXP(\
+                -EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(\
+                    CASE WHEN c.doc_metadata->>'updated_at' IS NOT NULL \
+                         AND pg_input_is_valid(c.doc_metadata->>'updated_at', 'timestamptz') \
+                    THEN (c.doc_metadata->>'updated_at')::timestamptz END, \
+                    c.doc_updated_at))) \
+                / (86400.0 * $6::double precision)))::real"
+        );
+
+        let query_str = format!(
+            r#"
+            WITH candidates AS MATERIALIZED (
+                SELECT
+                    e.document_id,
+                    e.embedding <=> $1 as distance,
+                    e.chunk_start_offset,
+                    e.chunk_end_offset,
+                    e.chunk_index,
+                    d.external_id,
+                    d.updated_at as doc_updated_at,
+                    d.metadata as doc_metadata,
+                    s.source_type
+                FROM embeddings e
+                JOIN documents d ON e.document_id = d.id
+                JOIN sources s ON s.id = d.source_id AND NOT s.is_deleted
+                {where_clause}
+                ORDER BY e.embedding <=> $1
+                LIMIT ($2 + $3) * 3
+            ),
+            scored_candidates AS (
+                SELECT
+                    c.document_id,
+                    c.distance / {recency_expr} as distance,
+                    c.chunk_start_offset,
+                    c.chunk_end_offset,
+                    c.chunk_index,
+                    c.external_id,
+                    c.doc_updated_at,
+                    c.source_type
+                FROM candidates c
+            ),
+            deduped_candidates AS (
+                SELECT document_id, distance, chunk_start_offset, chunk_end_offset, chunk_index
+                FROM (
+                    SELECT sc.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY sc.source_type, sc.external_id
+                               ORDER BY sc.distance ASC, sc.doc_updated_at DESC, sc.document_id, sc.chunk_index
+                           ) AS dedupe_rank
+                    FROM scored_candidates sc
+                ) ranked_candidates
+                WHERE dedupe_rank = 1
+            )
+            SELECT
+                dc.document_id,
+                dc.distance,
+                dc.chunk_start_offset,
+                dc.chunk_end_offset,
+                dc.chunk_index
+            FROM deduped_candidates dc
+            ORDER BY distance
+            LIMIT $2 OFFSET $3
+            "#,
+            where_clause = where_clause,
+            recency_expr = recency_expr,
+        );
+
+        let mut query = sqlx::query(&query_str)
+            .bind(&vector)
+            .bind(limit)
+            .bind(offset)
+            .bind(dims)
+            .bind(recency_boost_weight as f64)
+            .bind(recency_half_life_days as f64);
+
+        if let Some(doc_id) = document_id {
+            query = query.bind(doc_id);
+        }
+
+        if let Some(src) = source_types {
+            if !src.is_empty() {
+                query = query.bind(src);
+            }
+        }
+
+        if let Some(ct) = content_types {
+            if !ct.is_empty() {
+                query = query.bind(ct);
+            }
+        }
+
+        let results = query.fetch_all(&self.pool).await?;
+        let chunk_results = results
+            .into_iter()
+            .map(|row| {
+                let distance: Option<f64> = row.get("distance");
+                let similarity = (1.0 - distance.unwrap_or(1.0)) as f32;
+                ChunkResult {
+                    document_id: row.get("document_id"),
+                    similarity_score: similarity,
+                    chunk_start_offset: row.get("chunk_start_offset"),
+                    chunk_end_offset: row.get("chunk_end_offset"),
+                    chunk_index: row.get("chunk_index"),
+                }
+            })
+            .collect();
+
+        Ok(chunk_results)
+    }
+
     pub async fn get_facet_counts(
         &self,
         query: &str,
+        tantivy_query: Option<&str>,
         source_ids: &[String],
         content_types: Option<&[String]>,
         attribute_filters: Option<&HashMap<String, AttributeFilter>>,
@@ -391,22 +730,9 @@ impl SearchDocumentRepository {
             return Ok(rows_to_facets(rows));
         }
 
-        // Tokenize query via ParadeDB — same pipeline as search()
-        let raw_terms: Vec<String> =
-            sqlx::query_scalar("SELECT unnest($1::pdb.simple('ascii_folding=true')::text[])")
-                .bind(query)
-                .fetch_all(&self.pool)
-                .await?;
-
-        let mut seen = HashSet::new();
-        // Cap at 12 terms — same reasoning as search().
-        let terms: Vec<String> = raw_terms
-            .into_iter()
-            .filter(|t| seen.insert(t.clone()))
-            .take(12)
-            .collect();
-
-        let tantivy_query = build_tantivy_query(&terms, query);
+        let tantivy_query = tantivy_query.ok_or_else(|| {
+            DatabaseError::InvalidInput("tantivy query is required for facet counts".to_string())
+        })?;
 
         // Bind params: $1 = tantivy query string, then filters
         let mut param_idx = 2;
@@ -465,7 +791,7 @@ impl SearchDocumentRepository {
         );
 
         let mut query_builder =
-            sqlx::query_as::<_, (String, String, i64)>(&query_str).bind(&tantivy_query);
+            sqlx::query_as::<_, (String, String, i64)>(&query_str).bind(tantivy_query);
 
         query_builder = query_builder.bind(source_ids);
 
