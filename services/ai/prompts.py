@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from db.models import UserConfiguration
 from datetime_utils import format_datetime
+
+if TYPE_CHECKING:
+    from tools.connector_handler import ToolsetSummary
 
 SOURCE_DISPLAY_NAMES = {
     "google_drive": "Google Drive",
@@ -39,7 +45,7 @@ SYSTEM_PROMPT_TEMPLATE = """You are Omni AI, a workplace agent that helps employ
 Current date and time: {current_datetime}
 {user_line}
 Connected apps: {connected_apps}
-{actions_section}
+{toolsets_section}
 # Searching
 - The `search_documents` tool is the primary tool to query the Omni unified index that syncs data from all of the above connected apps.
 - Search results include relevant content snippets (highlights) extracted from the indexed documents. For most factual questions, these snippets already contain the answer — use them directly without calling `read_document`.
@@ -80,8 +86,8 @@ Connected apps: {connected_apps}
 - For processed spreadsheets or other output files, also use `present_artifact` so the user can download them.
 
 # Skills
-- Use `load_skill` to load detailed instructions when working with specific file types or complex tasks.
-- When working with Excel/spreadsheet files, load the "excel" skill first for guidance on data boundaries, merged cells, type inference, and the `excel` CLI tool.
+- Use `skill_search` to find detailed instructions when working with specific file types, connectors, or complex tasks, then call `load_skill` with the returned skill id.
+- When working with Excel/spreadsheet files, search for and load the Excel skill first for guidance on data boundaries, merged cells, type inference, and the `excel` CLI tool.
 {source_skill_lines}
 
 # Response style
@@ -102,7 +108,7 @@ When done, provide a brief summary of what you did and the outcomes.
 Current date and time: {current_datetime}
 {user_line}
 Connected apps: {connected_apps}
-{actions_section}
+{toolsets_section}
 # Searching
 - Use inline query operators for efficient filtering: in:slack, type:pdf, status:done, by:sarah, before:2024-06, after:2024-01.
 - Use multiple targeted searches rather than one broad search.
@@ -227,10 +233,51 @@ def _format_user_line(
     return f"{prefix}: {identity}"
 
 
+def _build_toolsets_section(
+    toolsets: list[ToolsetSummary] | None,
+    loaded_source_ids: set[str] | None,
+) -> str:
+    """Render the per-source toolset summary block.
+
+    Connector tools are loaded on demand (issue #203) so we advertise the
+    *toolsets* available rather than every individual action schema. The model
+    uses `tool_search` to find candidate tools and `load_tool` / `load_tool_set`
+    to admit tools into the conversation; once loaded, tools persist for the rest
+    of the chat. `loaded_source_ids` is accepted for caller compatibility but not
+    rendered: exact `load_tool` may load only one tool from a source, so source-
+    level loaded markers would be misleading.
+    """
+    if not toolsets:
+        return ""
+
+    lines = [
+        "",
+        "# Loadable connector toolsets",
+        (
+            "The connector toolsets below list additional connector actions you can "
+            "load into this conversation. Some tools from a listed source may already "
+            'be callable; always check your current tool list before loading. Use `tool_search("keywords")` '
+            "to find candidate tool names, then `load_tool(tool_name=...)` for the exact "
+            'tools you need. Use `load_tool_set(source_type="gmail")` only when you need '
+            "every tool for a source. Loaded tools persist for the rest of this conversation."
+        ),
+    ]
+    for ts in toolsets:
+        source_type = ts["source_type"]
+        display = SOURCE_DISPLAY_NAMES.get(source_type, source_type)
+        sample = ", ".join(ts.get("sample_tool_names") or []) or "—"
+        lines.append(
+            f"- {source_type} (source_id={ts['source_id']}): {display} · "
+            f"{ts['source_name']} · {ts['tool_count']} tools (e.g. {sample})"
+        )
+    return "\n".join(lines)
+
+
 def build_agent_system_prompt(
     agent,
     sources: list,
-    connector_actions: list | None = None,
+    toolsets: list[ToolsetSummary] | None = None,
+    loaded_source_ids: set[str] | None = None,
     user_name: str | None = None,
     user_email: str | None = None,
     memories: list[str] | None = None,
@@ -252,22 +299,7 @@ def build_agent_system_prompt(
 
     connected_apps = ", ".join(display_names) if display_names else "None"
 
-    actions_section = ""
-    if connector_actions:
-        actions_by_source: dict[str, list[str]] = {}
-        for action in connector_actions:
-            source_display = SOURCE_DISPLAY_NAMES.get(
-                action.source_type, action.source_type
-            )
-            action_desc = f"  - {action.action_name}: {action.description}"
-            actions_by_source.setdefault(source_display, []).append(action_desc)
-
-        actions_lines = ["\nAvailable actions:"]
-        for source_name, actions in actions_by_source.items():
-            actions_lines.append(f"{source_name}:")
-            actions_lines.extend(actions)
-
-        actions_section = "\n".join(actions_lines)
+    toolsets_section = _build_toolsets_section(toolsets, loaded_source_ids)
 
     user_line = _format_user_line(user_name, user_email, prefix="Running on behalf of")
 
@@ -276,7 +308,7 @@ def build_agent_system_prompt(
         current_datetime=format_datetime(user_configuration=user_configuration),
         user_line=user_line,
         connected_apps=connected_apps,
-        actions_section=actions_section,
+        toolsets_section=toolsets_section,
     )
 
     if memories:
@@ -288,17 +320,20 @@ def build_agent_system_prompt(
 
 def build_chat_system_prompt(
     sources: list,
-    connector_actions: list | None = None,
+    toolsets: list[ToolsetSummary] | None = None,
+    loaded_source_ids: set[str] | None = None,
     user_name: str | None = None,
     user_email: str | None = None,
     memories: list[str] | None = None,
     user_configuration: UserConfiguration | None = None,
 ) -> str:
-    """Build system prompt from active sources and connector actions.
+    """Build system prompt from active sources and available toolsets.
 
     Args:
         sources: list of Source dataclass instances (from db.models)
-        connector_actions: list of ConnectorAction dataclass instances (from tools.connector_handler)
+        toolsets: list of dicts produced by ConnectorToolHandler.list_toolsets().
+            Each entry: source_id, source_type, source_name, tool_count, sample_tool_names.
+        loaded_source_ids: source_ids whose tools are already loaded into this chat.
         user_name: display name of the current user
         user_email: email of the current user
         memories: list of memory strings to inject as remembered context
@@ -314,27 +349,7 @@ def build_chat_system_prompt(
 
     connected_apps = ", ".join(display_names) if display_names else "None"
 
-    actions_section = ""
-    if connector_actions:
-        actions_by_source: dict[str, list[str]] = {}
-        for action in connector_actions:
-            source_display = SOURCE_DISPLAY_NAMES.get(
-                action.source_type, action.source_type
-            )
-            mode_label = (
-                "read" if action.mode == "read" else "write — requires approval"
-            )
-            action_desc = (
-                f"  - {action.action_name}: {action.description} [{mode_label}]"
-            )
-            actions_by_source.setdefault(source_display, []).append(action_desc)
-
-        actions_lines = ["\nAvailable actions:"]
-        for source_name, actions in actions_by_source.items():
-            actions_lines.append(f"{source_name}:")
-            actions_lines.extend(actions)
-
-        actions_section = "\n".join(actions_lines)
+    toolsets_section = _build_toolsets_section(toolsets, loaded_source_ids)
 
     user_line = _format_user_line(user_name, user_email)
 
@@ -342,7 +357,7 @@ def build_chat_system_prompt(
         current_datetime=format_datetime(user_configuration=user_configuration),
         user_line=user_line,
         connected_apps=connected_apps,
-        actions_section=actions_section,
+        toolsets_section=toolsets_section,
         source_skill_lines=_source_skill_lines(seen),
     )
 

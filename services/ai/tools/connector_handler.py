@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 import httpx
 import redis.asyncio as aioredis
@@ -24,10 +26,36 @@ from tools.sandbox import (
 logger = logging.getLogger(__name__)
 
 ACTIONS_CACHE_TTL = 60  # seconds
+_TOOL_NAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9_]")
 
 SourceMode = Literal["read", "write"]
 # Maps source_id -> list of modes allowed for that source.
 SourceFilter = dict[str, list[SourceMode]]
+
+
+def sources_from_sync_overview_response(payload: object) -> list[Source]:
+    if not isinstance(payload, list):
+        raise TypeError("connector-manager /sources response must be a list")
+
+    sources: list[Source] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                "connector-manager /sources response contains a non-object item"
+            )
+        source_payload = item["source"]
+        if not isinstance(source_payload, Mapping):
+            raise TypeError("connector-manager source overview missing source object")
+        sources.append(Source.from_row(source_payload))
+    return sources
+
+
+class ToolsetSummary(TypedDict):
+    source_id: str
+    source_type: str
+    source_name: str
+    tool_count: int
+    sample_tool_names: list[str]
 
 
 @dataclass
@@ -145,7 +173,7 @@ class ConnectorToolHandler:
                         f"{self._connector_manager_url}/sources"
                     )
                     sources_resp.raise_for_status()
-                    sources = [Source.from_row(s["source"]) for s in sources_resp.json()]
+                    sources = sources_from_sync_overview_response(sources_resp.json())
 
         except Exception as e:
             logger.error(f"Failed to fetch connector info: {e}")
@@ -223,7 +251,7 @@ class ConnectorToolHandler:
         self._actions.clear()
         self._tools.clear()
 
-        seen_tools: set[str] = set()
+        base_name_counts: dict[str, int] = {}
         for action in actions:
             # Hidden actions (e.g. internal setup actions) never appear in
             # chat/agent tool lists, admins included.
@@ -242,16 +270,22 @@ class ConnectorToolHandler:
                     continue
 
             # Namespace: {source_type}__{action_name}
-            tool_name = f"{action.source_type}__{action.action_name}"
+            base_tool_name = f"{action.source_type}__{action.action_name}"
 
             # Apply action_whitelist: skip actions not in whitelist
             if self._action_whitelist is not None:
-                if tool_name not in self._action_whitelist:
+                if base_tool_name not in self._action_whitelist:
                     continue
 
-            if tool_name in seen_tools:
-                continue
-            seen_tools.add(tool_name)
+            occurrence = base_name_counts.get(base_tool_name, 0)
+            base_name_counts[base_tool_name] = occurrence + 1
+            if occurrence == 0:
+                tool_name = base_tool_name
+            else:
+                source_suffix = _TOOL_NAME_SAFE_RE.sub("_", action.source_id)
+                tool_name = f"{base_tool_name}__source_{source_suffix}"
+                if tool_name in self._actions:
+                    tool_name = f"{tool_name}_{occurrence + 1}"
 
             self._actions[tool_name] = action
 
@@ -271,6 +305,43 @@ class ConnectorToolHandler:
     def get_tools(self) -> list[ToolParam]:
         # Note: caller must await _ensure_initialized() before calling this
         return self._tools
+
+    @property
+    def actions(self) -> dict[str, ConnectorAction]:
+        """All resolved actions, keyed by namespaced tool name."""
+        return self._actions
+
+    def filtered_tools(self, allowed_tool_names: set[str]) -> list[ToolParam]:
+        """Subset of tools explicitly loaded into the current session."""
+        if not allowed_tool_names:
+            return []
+        return [tool for tool in self._tools if tool["name"] in allowed_tool_names]
+
+    def list_toolsets(self) -> list[ToolsetSummary]:
+        """One entry per source for prompt rendering and tool_search.
+
+        Returns dicts with: source_id, source_type, source_name, tool_count,
+        sample_tool_names (up to 3 for the LLM to skim).
+        """
+        by_source: dict[str, list[ConnectorAction]] = {}
+        for tool_name, action in self._actions.items():
+            by_source.setdefault(action.source_id, []).append(action)
+
+        toolsets: list[ToolsetSummary] = []
+        for source_id, actions in by_source.items():
+            sample = sorted({a.action_name for a in actions})[:3]
+            first = actions[0]
+            toolsets.append(
+                {
+                    "source_id": source_id,
+                    "source_type": first.source_type,
+                    "source_name": first.source_name,
+                    "tool_count": len(actions),
+                    "sample_tool_names": sample,
+                }
+            )
+        toolsets.sort(key=lambda t: (t["source_type"], t["source_name"]))
+        return toolsets
 
     def can_handle(self, tool_name: str) -> bool:
         return tool_name in self._actions

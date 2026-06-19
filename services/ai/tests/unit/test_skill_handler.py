@@ -3,7 +3,45 @@ from __future__ import annotations
 import pytest
 
 from tools.registry import ToolContext
+from tools.searcher_client import CapabilitySearchResponse, CapabilitySearchResult
 from tools.skill_handler import SkillHandler
+
+
+class _FakeSearcherClient:
+    def __init__(self, include_excel: bool = True) -> None:
+        self.upserts = []
+        self.searches = []
+        self.include_excel = include_excel
+
+    async def upsert_capabilities(self, request):
+        self.upserts.append(request)
+        return type("Resp", (), {"upserted": len(request.capabilities)})()
+
+    async def search_capabilities(self, request):
+        self.searches.append(request)
+        results = []
+        if self.include_excel:
+            results.append(
+                CapabilitySearchResult(
+                    id="skill:excel",
+                    capability_type="skill",
+                    name="excel",
+                    description="Spreadsheet guidance",
+                    search_text="Excel Skill Spreadsheet guidance",
+                    data={
+                        "skill_id": "excel",
+                        "title": "Excel Skill",
+                        "description": "Spreadsheet guidance",
+                        "body": "Inspect spreadsheet headers and merged cells.",
+                    },
+                    score=4.2,
+                )
+            )
+        return CapabilitySearchResponse(results=results)
+
+
+def _ctx() -> ToolContext:
+    return ToolContext(chat_id="c1", user_id="u1")
 
 
 @pytest.mark.asyncio
@@ -27,10 +65,13 @@ async def test_skill_handler_discovers_directory_skills_and_legacy_files(tmp_pat
     assert sorted(handler._available) == ["excel", "google_ads", "legacy_only"]
     assert handler._available["excel"] == excel_dir / "SKILL.md"
 
-    context = ToolContext(chat_id="chat", user_id="user")
-    excel_result = await handler.execute("load_skill", {"skill": "excel"}, context)
-    legacy_result = await handler.execute("load_skill", {"skill": "legacy_only"}, context)
-    google_ads_result = await handler.execute("load_skill", {"skill": "google_ads"}, context)
+    excel_result = await handler.execute("load_skill", {"skill": "excel"}, _ctx())
+    legacy_result = await handler.execute(
+        "load_skill", {"skill": "legacy_only"}, _ctx()
+    )
+    google_ads_result = await handler.execute(
+        "load_skill", {"skill": "google_ads"}, _ctx()
+    )
 
     assert not excel_result.is_error
     assert excel_result.content[0]["text"] == "directory excel"
@@ -38,16 +79,48 @@ async def test_skill_handler_discovers_directory_skills_and_legacy_files(tmp_pat
     assert google_ads_result.content[0]["text"] == "google ads skill"
 
 
-def test_skill_handler_tool_description_lists_directory_skills(tmp_path):
-    skills_dir = tmp_path / "skills"
-    (skills_dir / "google_ads").mkdir(parents=True)
-    (skills_dir / "google_ads" / "SKILL.md").write_text(
-        "google ads skill", encoding="utf-8"
-    )
+@pytest.mark.asyncio
+async def test_publish_skill_capabilities_uses_searcher(tmp_path):
+    (tmp_path / "excel.md").write_text("# Excel Skill\n\nInspect spreadsheets.")
+    skill_dir = tmp_path / "slack"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# Slack Skill\n\nThreads.")
+    searcher = _FakeSearcherClient()
+    handler = SkillHandler(tmp_path, searcher_client=searcher)
 
-    handler = SkillHandler(skills_dir)
-    tool = handler.get_tools()[0]
+    await handler.publish_skill_capabilities()
 
-    assert tool["name"] == "load_skill"
-    assert "google_ads" in tool["description"]
-    assert "google_ads" in tool["input_schema"]["properties"]["skill"]["description"]
+    assert searcher.upserts
+    assert {c.id for c in searcher.upserts[0].capabilities} == {
+        "skill:excel",
+        "skill:slack",
+    }
+
+
+@pytest.mark.asyncio
+async def test_skill_search_uses_searcher_without_republishing(tmp_path):
+    (tmp_path / "excel.md").write_text("# Excel Skill\n\nInspect spreadsheets.")
+    searcher = _FakeSearcherClient()
+    handler = SkillHandler(tmp_path, searcher_client=searcher)
+
+    await handler.publish_skill_capabilities()
+    result = await handler.execute("skill_search", {"query": "spreadsheet"}, _ctx())
+    await handler.execute("skill_search", {"query": "spreadsheet"}, _ctx())
+
+    assert not result.is_error
+    assert "excel" in result.content[0]["text"]
+    assert len(searcher.upserts) == 1
+    assert len(searcher.searches) == 2
+    assert searcher.searches[0].capability_type == "skill"
+    assert searcher.searches[0].allowed_ids == ["skill:excel"]
+
+
+@pytest.mark.asyncio
+async def test_skill_search_empty_searcher_results_do_not_fall_back(tmp_path):
+    (tmp_path / "excel.md").write_text("# Excel Skill\n\nSpreadsheet formulas.")
+    handler = SkillHandler(tmp_path, searcher_client=_FakeSearcherClient(False))
+
+    result = await handler.execute("skill_search", {"query": "formulas"}, _ctx())
+
+    assert not result.is_error
+    assert "No skills matched" in result.content[0]["text"]

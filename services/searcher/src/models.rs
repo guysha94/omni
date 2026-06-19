@@ -190,6 +190,70 @@ pub struct AttributeValuesResponse {
     pub attributes: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CapabilityUpsert {
+    pub id: String,
+    pub capability_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    pub search_text: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CapabilitiesUpsertRequest {
+    pub capabilities: Vec<CapabilityUpsert>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesUpsertResponse {
+    pub upserted: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CapabilitySearchRequest {
+    pub capability_type: String,
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub allowed_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_source_ids: Option<Vec<String>>,
+}
+
+impl CapabilitySearchRequest {
+    pub fn limit(&self) -> i64 {
+        self.limit.unwrap_or(10).clamp(1, 50)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitySearchResult {
+    pub id: String,
+    pub capability_type: String,
+    pub name: String,
+    pub description: String,
+    pub user_id: Option<String>,
+    pub source_id: Option<String>,
+    pub source_type: Option<String>,
+    pub search_text: String,
+    pub data: serde_json::Value,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitySearchResponse {
+    pub results: Vec<CapabilitySearchResult>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
